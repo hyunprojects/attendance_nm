@@ -25,15 +25,8 @@ const formatHours = (hours) => {
   return h > 0 ? `${h}h ${m}m` : `${m}m`
 }
 
-/**
- * Pair TIME IN / TIME OUT events per driver and compute worked / remaining hours.
- * Also flags anomalies:
- *  - double-in (in while already in)
- *  - stray-out (out with no matching in)
- */
 const computeDriverHours = (logs) => {
   const now = Date.now()
-
   const byDriver = new Map()
   for (const log of logs) {
     const key = log.driver_name || 'Unknown'
@@ -52,25 +45,21 @@ const computeDriverHours = (logs) => {
     let workedMs = 0
     let openIn = null
     let openInId = null
+    let openInLog = null
 
     for (const e of sorted) {
       const t = new Date(e.created_at).getTime()
-
       if (e.action_type === 'in') {
-        if (openIn !== null) {
-          anomalies.add(e.id)
-          continue
-        }
+        if (openIn !== null) { anomalies.add(e.id); continue }
         openIn = t
         openInId = e.id
+        openInLog = e
       } else if (e.action_type === 'out') {
-        if (openIn === null) {
-          anomalies.add(e.id)
-          continue
-        }
+        if (openIn === null) { anomalies.add(e.id); continue }
         workedMs += Math.max(0, t - openIn)
         openIn = null
         openInId = null
+        openInLog = null
       }
     }
 
@@ -88,24 +77,18 @@ const computeDriverHours = (logs) => {
       isOnDuty,
       clockedInAt: openIn,
       clockedInId: openInId,
+      clockedInLog: openInLog,
       plate: sorted[0]?.plate_number ?? '',
     })
   }
-
   return { driverHours: result, anomalies }
 }
 
-// Only this account can delete records
 const ADMIN_EMAIL = 'elendaday@gmail.com'
 
-// Geofence: warehouse / base location. Adjust to your real coords.
-const GEOFENCE = {
-  lat: 14.5995,
-  lng: 120.9842,
-  radiusMeters: 300,
-}
+// Geofence fallback (used until DB settings load)
+const DEFAULT_GEOFENCE = { lat: 14.5995, lng: 120.9842, radiusMeters: 300 }
 
-// Haversine distance in meters
 const haversine = (lat1, lon1, lat2, lon2) => {
   const R = 6371000
   const toRad = (d) => (d * Math.PI) / 180
@@ -117,37 +100,35 @@ const haversine = (lat1, lon1, lat2, lon2) => {
   return 2 * R * Math.asin(Math.sqrt(a))
 }
 
-const isInsideGeofence = (lat, lng) => {
-  if (lat == null || lng == null) return null
-  return haversine(lat, lng, GEOFENCE.lat, GEOFENCE.lng) <= GEOFENCE.radiusMeters
+// Prefer per-record snapshot when available, else current global geofence
+const resolveGeofenceFor = (log, geofence) => {
+  if (log?.geo_lat != null && log?.geo_lng != null && log?.geo_radius != null) {
+    return { lat: log.geo_lat, lng: log.geo_lng, radiusMeters: log.geo_radius }
+  }
+  return geofence
+}
+
+const isInsideGeofence = (lat, lng, geo) => {
+  if (lat == null || lng == null || !geo) return null
+  return haversine(lat, lng, geo.lat, geo.lng) <= geo.radiusMeters
 }
 
 const mapsLink = (lat, lng) =>
-  lat != null && lng != null
-    ? `https://www.google.com/maps?q=${lat},${lng}`
-    : null
+  lat != null && lng != null ? `https://www.google.com/maps?q=${lat},${lng}` : null
 
-// ---------- TOAST HOOK ----------
+// ---------- TOAST ----------
 function useToasts() {
   const [toasts, setToasts] = useState([])
   const idRef = useRef(0)
-
   const dismiss = useCallback((id) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
-
-  const push = useCallback(
-    (message, type = 'info', duration = 3500) => {
-      const id = ++idRef.current
-      setToasts((prev) => [...prev, { id, message, type }])
-      if (duration > 0) {
-        setTimeout(() => dismiss(id), duration)
-      }
-      return id
-    },
-    [dismiss]
-  )
-
+  const push = useCallback((message, type = 'info', duration = 3500) => {
+    const id = ++idRef.current
+    setToasts((prev) => [...prev, { id, message, type }])
+    if (duration > 0) setTimeout(() => dismiss(id), duration)
+    return id
+  }, [dismiss])
   return { toasts, push, dismiss }
 }
 
@@ -161,12 +142,19 @@ export default function AdminDashboard() {
   const [clearing, setClearing] = useState(false)
   const [currentUserEmail, setCurrentUserEmail] = useState(null)
   const [tick, setTick] = useState(0)
+  const [geofence, setGeofence] = useState(DEFAULT_GEOFENCE)
+  const [geoEditorOpen, setGeoEditorOpen] = useState(false)
+  const [geoDraft, setGeoDraft] = useState(DEFAULT_GEOFENCE)
+  const [geoBusy, setGeoBusy] = useState(false)
+  const [groupByDriver, setGroupByDriver] = useState(false)
+  const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
+  const [autoCloseBusy, setAutoCloseBusy] = useState(false)
   const navigate = useNavigate()
 
   const { toasts, push: toast, dismiss: dismissToast } = useToasts()
-
   const sidebarRef = useRef(null)
   const burgerRef = useRef(null)
+  const autoCloseRef = useRef(new Set()) // ids we've recently tried to auto-close
 
   // Auth guard
   useEffect(() => {
@@ -175,7 +163,6 @@ export default function AdminDashboard() {
     })
   }, [navigate])
 
-  // Current user email (for delete permissions)
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
       if (data?.user) setCurrentUserEmail(data.user.email)
@@ -184,12 +171,32 @@ export default function AdminDashboard() {
 
   const canDelete = currentUserEmail === ADMIN_EMAIL
 
-  // Re-render every 30s so "remaining hours" ticks down live
   useEffect(() => {
     const id = setInterval(() => setTick((t) => t + 1), 30000)
     return () => clearInterval(id)
   }, [])
 
+  // ---------- Load geofence settings ----------
+  const fetchGeofence = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('geofence_settings')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle()
+    if (!error && data) {
+      const g = {
+        lat: Number(data.lat),
+        lng: Number(data.lng),
+        radiusMeters: Number(data.radius_meters),
+      }
+      setGeofence(g)
+      setGeoDraft(g)
+    }
+  }, [])
+
+  useEffect(() => { fetchGeofence() }, [fetchGeofence])
+
+  // ---------- Load logs ----------
   const fetchLogs = useCallback(async () => {
     const today = new Date()
     today.setHours(0, 0, 0, 0)
@@ -211,7 +218,6 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     fetchLogs()
-
     const channel = supabase
       .channel('realtime-attendance')
       .on(
@@ -221,13 +227,18 @@ export default function AdminDashboard() {
           setLogs((prev) => {
             if (prev.some((l) => l.id === payload.new.id)) return prev
             toast(
-              `${payload.new.driver_name} ${
-                payload.new.action_type === 'in' ? 'timed in' : 'timed out'
-              }`,
+              `${payload.new.driver_name} ${payload.new.action_type === 'in' ? 'timed in' : 'timed out'}`,
               payload.new.action_type === 'in' ? 'success' : 'info'
             )
             return [payload.new, ...prev]
           })
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'attendance' },
+        (payload) => {
+          setLogs((prev) => prev.map((l) => (l.id === payload.new.id ? payload.new : l)))
         }
       )
       .on(
@@ -238,30 +249,22 @@ export default function AdminDashboard() {
         }
       )
       .subscribe()
-
-    return () => {
-      supabase.removeChannel(channel)
-    }
+    return () => { supabase.removeChannel(channel) }
   }, [fetchLogs, toast])
 
-  // ---------- MOBILE MENU: scroll lock + auto-close on desktop ----------
+  // Mobile menu
   useEffect(() => {
     document.body.style.overflow = menuOpen ? 'hidden' : ''
-    return () => {
-      document.body.style.overflow = ''
-    }
+    return () => { document.body.style.overflow = '' }
   }, [menuOpen])
 
   useEffect(() => {
     const mq = window.matchMedia('(min-width: 761px)')
-    const onChange = (e) => {
-      if (e.matches) setMenuOpen(false)
-    }
+    const onChange = (e) => { if (e.matches) setMenuOpen(false) }
     mq.addEventListener('change', onChange)
     return () => mq.removeEventListener('change', onChange)
   }, [])
 
-  // ---------- KEYBOARD ACCESSIBILITY ----------
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === 'Escape' && menuOpen) {
@@ -273,36 +276,23 @@ export default function AdminDashboard() {
     return () => window.removeEventListener('keydown', onKey)
   }, [menuOpen])
 
-  // Focus trap for the mobile sidebar
   useEffect(() => {
     if (!menuOpen) return
     const node = sidebarRef.current
     if (!node) return
-
     const focusable = node.querySelectorAll(
       'button:not(:disabled), [href], input, [tabindex]:not([tabindex="-1"])'
     )
     const first = focusable[0]
     const last = focusable[focusable.length - 1]
-
     const trap = (e) => {
       if (e.key !== 'Tab') return
-      if (focusable.length === 0) {
-        e.preventDefault()
-        return
-      }
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault()
-        last.focus()
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault()
-        first.focus()
-      }
+      if (focusable.length === 0) { e.preventDefault(); return }
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
     }
-
     node.addEventListener('keydown', trap)
     first?.focus()
-
     return () => node.removeEventListener('keydown', trap)
   }, [menuOpen])
 
@@ -333,11 +323,9 @@ export default function AdminDashboard() {
       if (filter === 'in' || filter === 'out') {
         matchFilter = l.action_type === filter
       } else if (filter === 'overtime') {
-        // Check if this driver has overtime hours
         const h = driverHours.get(l.driver_name)
         matchFilter = h ? h.overtimeHours > 0 : false
       }
-
       const matchSearch =
         !q ||
         l.driver_name?.toLowerCase().includes(q) ||
@@ -346,11 +334,35 @@ export default function AdminDashboard() {
     })
   }, [logs, search, filter, driverHours])
 
+  // ---------- Grouped rows (Sort by Driver) ----------
+  const grouped = useMemo(() => {
+    const map = new Map()
+    for (const log of visibleLogs) {
+      const key = log.driver_name || 'Unknown'
+      if (!map.has(key)) map.set(key, [])
+      map.get(key).push(log)
+    }
+    const arr = [...map.entries()].map(([driver, items]) => ({
+      driver,
+      items: items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)),
+      hours: driverHours.get(driver),
+      plate: items[0]?.plate_number ?? '',
+    }))
+    arr.sort((a, b) => a.driver.localeCompare(b.driver))
+    return arr
+  }, [visibleLogs, driverHours])
+
+  const toggleGroup = (driver) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(driver)) next.delete(driver)
+      else next.add(driver)
+      return next
+    })
+  }
+
   const hoursSummary = useMemo(() => {
-    let completed = 0
-    let overtime = 0
-    let onDuty = 0
-    let totalRemaining = 0
+    let completed = 0, overtime = 0, onDuty = 0, totalRemaining = 0
     for (const [, h] of driverHours) {
       if (h.overtimeHours > 0) overtime++
       else if (h.remainingHours <= 0) completed++
@@ -361,123 +373,183 @@ export default function AdminDashboard() {
   }, [driverHours])
 
   const geoSummary = useMemo(() => {
-    let inside = 0
-    let outside = 0
-    let unknown = 0
+    let inside = 0, outside = 0, unknown = 0
     for (const l of logs) {
-      const insideGeo = isInsideGeofence(l.latitude, l.longitude)
-      if (insideGeo === true) inside++
-      else if (insideGeo === false) outside++
+      const geo = resolveGeofenceFor(l, geofence)
+      const ok = isInsideGeofence(l.latitude, l.longitude, geo)
+      if (ok === true) inside++
+      else if (ok === false) outside++
       else unknown++
     }
     return { inside, outside, unknown }
-  }, [logs])
+  }, [logs, geofence])
 
-  // ---------- DELETE ONE ----------
+  // Sidebar Drivers badge: on-duty + anomalies
+  const driversBadge = useMemo(() => {
+    return hoursSummary.onDuty + anomalies.size
+  }, [hoursSummary.onDuty, anomalies.size])
+
+  // ---------- AUTO-CLOCK-OUT ----------
+  // Drivers with open session whose latest known point is outside geofence
+  const autoCloseCandidates = useMemo(() => {
+    const now = Date.now()
+    const list = []
+    for (const [driver, h] of driverHours) {
+      if (!h.isOnDuty || !h.clockedInLog) continue
+      const l = h.clockedInLog
+      const geo = resolveGeofenceFor(l, geofence)
+      const inside = isInsideGeofence(l.latitude, l.longitude, geo)
+      if (inside === false) {
+        list.push({ driver, log: l, geo, now })
+      }
+    }
+    return list
+  }, [driverHours, geofence, tick])
+
+  const runAutoClockOut = useCallback(async (silent = false) => {
+    if (!canDelete || autoCloseCandidates.length === 0 || autoCloseBusy) return
+    const fresh = autoCloseCandidates.filter(
+      (c) => !autoCloseRef.current.has(c.log.id)
+    )
+    if (fresh.length === 0) return
+
+    setAutoCloseBusy(true)
+    let okCount = 0
+    for (const c of fresh) {
+      autoCloseRef.current.add(c.log.id)
+      const { error } = await supabase.from('attendance').insert({
+        driver_name: c.driver,
+        plate_number: c.log.plate_number,
+        action_type: 'out',
+        latitude: c.log.latitude,
+        longitude: c.log.longitude,
+        geo_lat: c.geo.lat,
+        geo_lng: c.geo.lng,
+        geo_radius: c.geo.radiusMeters,
+        auto_closed: true,
+        closed_at: new Date().toISOString(),
+      })
+      if (error) {
+        console.warn('Auto clock-out failed for', c.driver, error.message)
+        autoCloseRef.current.delete(c.log.id)
+      } else {
+        okCount++
+      }
+    }
+    setAutoCloseBusy(false)
+    if (okCount > 0 && !silent) {
+      toast(`Auto clocked-out ${okCount} driver(s) outside geofence.`, 'info')
+    }
+  }, [canDelete, autoCloseCandidates, autoCloseBusy, toast])
+
+  // Auto-run every 30s, and on demand via button
+  useEffect(() => {
+    if (!canDelete) return
+    if (autoCloseCandidates.length === 0) return
+    const id = setTimeout(() => { runAutoClockOut(true) }, 2500)
+    return () => clearTimeout(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoCloseCandidates.length, canDelete])
+
+  // ---------- DELETE ----------
   const handleDelete = async (id) => {
     if (!canDelete) return
     if (!window.confirm('Delete this attendance record?')) return
     setBusyId(id)
     const { error } = await supabase.from('attendance').delete().eq('id', id)
-    if (error) {
-      toast('Failed to delete: ' + error.message, 'error')
-    } else {
+    if (error) toast('Failed to delete: ' + error.message, 'error')
+    else {
       setLogs((prev) => prev.filter((l) => l.id !== id))
       toast('Record deleted.', 'success')
     }
     setBusyId(null)
   }
 
-  // ---------- CLEAR ALL TODAY ----------
   const handleClearAll = async () => {
     if (!canDelete) return
     if (logs.length === 0) return
-    if (
-      !window.confirm(
-        `Delete all ${logs.length} attendance record(s) from today? This cannot be undone.`
-      )
-    )
-      return
-
+    if (!window.confirm(`Delete all ${logs.length} attendance record(s) from today? This cannot be undone.`)) return
     setClearing(true)
     const ids = logs.map((l) => l.id)
     const { error } = await supabase.from('attendance').delete().in('id', ids)
-
-    if (error) {
-      toast('Failed to clear: ' + error.message, 'error')
-    } else {
+    if (error) toast('Failed to clear: ' + error.message, 'error')
+    else {
       setLogs([])
       toast(`Cleared ${ids.length} record(s).`, 'success')
     }
     setClearing(false)
   }
 
-  // ---------- EXPORT CSV ----------
+  // ---------- EXPORT ----------
   const handleExport = () => {
     if (visibleLogs.length === 0) {
       toast('Nothing to export.', 'info')
       return
     }
-
     const headers = [
-      'Driver',
-      'Plate Number',
-      'Action',
-      'Time',
-      'Date',
-      'Worked Hours',
-      'Remaining Hours',
-      'Latitude',
-      'Longitude',
-      'Location Status',
-      'Anomaly',
+      'Driver','Plate Number','Action','Time','Date','Worked Hours','Remaining Hours',
+      'Latitude','Longitude','Location Status','Auto-closed','Anomaly',
     ]
     const rows = visibleLogs.map((l) => {
       const d = new Date(l.created_at)
       const h = driverHours.get(l.driver_name)
-      const inside = isInsideGeofence(l.latitude, l.longitude)
+      const geo = resolveGeofenceFor(l, geofence)
+      const inside = isInsideGeofence(l.latitude, l.longitude, geo)
       return [
-        l.driver_name ?? '',
-        l.plate_number ?? '',
+        l.driver_name ?? '', l.plate_number ?? '',
         l.action_type === 'in' ? 'TIME IN' : 'TIME OUT',
-        d.toLocaleTimeString(),
-        d.toLocaleDateString(),
+        d.toLocaleTimeString(), d.toLocaleDateString(),
         h ? formatHours(h.workedHours) : '',
         h ? formatHours(h.remainingHours) : '',
-        l.latitude ?? '',
-        l.longitude ?? '',
+        l.latitude ?? '', l.longitude ?? '',
         inside === null ? 'Unknown' : inside ? 'Inside geofence' : 'Outside geofence',
+        l.auto_closed ? 'Yes' : '',
         anomalies.has(l.id) ? 'Duplicate / out-of-order' : '',
       ]
     })
-
     const escape = (val) => `"${String(val).replace(/"/g, '""')}"`
-    const csv = [headers, ...rows]
-      .map((r) => r.map(escape).join(','))
-      .join('\r\n')
-
+    const csv = [headers, ...rows].map((r) => r.map(escape).join(',')).join('\r\n')
     const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     const stamp = new Date().toISOString().slice(0, 10)
     a.href = url
     a.download = `attendance-${stamp}.csv`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
+    document.body.appendChild(a); a.click(); document.body.removeChild(a)
     URL.revokeObjectURL(url)
     toast(`Exported ${rows.length} row(s).`, 'success')
   }
 
-  // Donut chart math
-  const R = 70
-  const C = 2 * Math.PI * R
+  // ---------- Save geofence ----------
+  const saveGeofence = async () => {
+    setGeoBusy(true)
+    const { error } = await supabase
+      .from('geofence_settings')
+      .update({
+        lat: Number(geoDraft.lat),
+        lng: Number(geoDraft.lng),
+        radius_meters: Number(geoDraft.radiusMeters),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', 1)
+    setGeoBusy(false)
+    if (error) { toast('Failed to save geofence: ' + error.message, 'error'); return }
+    setGeofence({
+      lat: Number(geoDraft.lat),
+      lng: Number(geoDraft.lng),
+      radiusMeters: Number(geoDraft.radiusMeters),
+    })
+    setGeoEditorOpen(false)
+    toast('Geofence updated.', 'success')
+  }
+
+  // Donut
+  const R = 70, C = 2 * Math.PI * R
   const inShare = stats.total ? stats.timeIn / stats.total : 0
 
   const renderHoursCell = (driverName) => {
     const h = driverHours.get(driverName)
     if (!h) return <span className="ad-hours-muted">—</span>
-
     if (h.overtimeHours > 0) {
       return (
         <span className="ad-hours-badge overtime" title={`Worked ${formatHours(h.workedHours)}`}>
@@ -503,21 +575,17 @@ export default function AdminDashboard() {
   }
 
   const renderLocationCell = (log) => {
-    const inside = isInsideGeofence(log.latitude, log.longitude)
+    const geo = resolveGeofenceFor(log, geofence)
+    const inside = isInsideGeofence(log.latitude, log.longitude, geo)
     const link = mapsLink(log.latitude, log.longitude)
-
     if (inside === null) {
       return <span className="ad-geo-muted" title="No GPS data captured">No GPS</span>
     }
-
     const cls = inside ? 'inside' : 'outside'
     const label = inside ? 'Inside' : 'Outside'
     const tip = inside
-      ? 'Within geofence'
-      : `Outside geofence (${Math.round(
-          haversine(log.latitude, log.longitude, GEOFENCE.lat, GEOFENCE.lng)
-        )}m away)`
-
+      ? `Within geofence (${geo.radiusMeters}m)`
+      : `Outside geofence (${Math.round(haversine(log.latitude, log.longitude, geo.lat, geo.lng))}m away)`
     return (
       <a
         className={`ad-geo-pill ${cls}`}
@@ -534,32 +602,83 @@ export default function AdminDashboard() {
 
   const closeMenu = () => setMenuOpen(false)
 
+  const renderRow = (log) => {
+    const h = driverHours.get(log.driver_name)
+    const isAnomaly = anomalies.has(log.id)
+    return (
+      <tr
+        key={log.id}
+        className={`${isAnomaly ? 'ad-row-anomaly' : ''} ${log.auto_closed ? 'ad-row-auto' : ''}`}
+      >
+        <td className="cell-driver">
+          <div className="ad-driver">
+            <span className="ad-avatar sm" aria-hidden="true">{initials(log.driver_name)}</span>
+            <span className="ad-driver-name">{log.driver_name}</span>
+            {log.auto_closed && (
+              <span className="ad-auto-badge" title="Auto-closed because driver left geofence">AUTO</span>
+            )}
+            {isAnomaly && (
+              <span
+                className="ad-anomaly-badge"
+                title="Duplicate or out-of-order scan — ignored for hours calculation"
+                aria-label="Anomaly"
+              >⚠</span>
+            )}
+          </div>
+        </td>
+        <td data-label="Plate">{log.plate_number}</td>
+        <td data-label="Time">{new Date(log.created_at).toLocaleTimeString()}</td>
+        <td data-label="Action">
+          <span className={`ad-badge ${log.action_type}`}>
+            {log.action_type === 'in' ? 'TIME IN' : 'TIME OUT'}
+          </span>
+        </td>
+        <td data-label="Location">{renderLocationCell(log)}</td>
+        <td data-label="Worked">
+          {h ? (
+            <span className="ad-worked" title="Total worked today">
+              {formatHours(h.workedHours)}
+              {h.isOnDuty && <span className="ad-live-dot" title="Currently on duty" aria-label="On duty" />}
+            </span>
+          ) : (
+            <span className="ad-hours-muted">—</span>
+          )}
+        </td>
+        <td data-label="Hours left">{renderHoursCell(log.driver_name)}</td>
+        <td className="cell-actions">
+          {canDelete ? (
+            <button
+              className="ad-row-delete"
+              onClick={() => handleDelete(log.id)}
+              disabled={busyId === log.id}
+              aria-label={`Delete attendance record for ${log.driver_name}`}
+              title="Delete this record"
+            >
+              {busyId === log.id ? '…' : '✕'}
+            </button>
+          ) : null}
+        </td>
+      </tr>
+    )
+  }
+
   return (
     <div className="ad-shell">
-      {/* ---------- Toasts ---------- */}
       <div className="ad-toasts" role="status" aria-live="polite">
         {toasts.map((t) => (
           <div key={t.id} className={`ad-toast ${t.type}`}>
             <span>{t.message}</span>
-            <button
-              className="ad-toast-close"
-              onClick={() => dismissToast(t.id)}
-              aria-label="Dismiss notification"
-            >
-              ✕
-            </button>
+            <button className="ad-toast-close" onClick={() => dismissToast(t.id)} aria-label="Dismiss">✕</button>
           </div>
         ))}
       </div>
 
-      {/* ---------- Backdrop (mobile only) ---------- */}
       <div
         className={`ad-backdrop ${menuOpen ? 'show' : ''}`}
         onClick={closeMenu}
         aria-hidden="true"
       />
 
-      {/* ---------- Sidebar ---------- */}
       <aside
         id="ad-sidebar"
         ref={sidebarRef}
@@ -580,7 +699,14 @@ export default function AdminDashboard() {
         <nav className="ad-nav">
           <button className="active" aria-current="page" onClick={closeMenu}>▦ Attendance</button>
           <button disabled>₱ Revenue</button>
-          <button disabled>🚕 Drivers</button>
+          <button disabled className="ad-nav-with-badge">
+            <span>🚕 Drivers</span>
+            {driversBadge > 0 && (
+              <span className="ad-nav-badge" title={`${hoursSummary.onDuty} on duty · ${anomalies.size} anomalies`}>
+                {driversBadge}
+              </span>
+            )}
+          </button>
         </nav>
 
         <p className="ad-nav-label">SETTINGS</p>
@@ -590,7 +716,6 @@ export default function AdminDashboard() {
         </nav>
       </aside>
 
-      {/* ---------- Main ---------- */}
       <main className="ad-main">
         <header className="ad-topbar">
           <button
@@ -600,111 +725,78 @@ export default function AdminDashboard() {
             aria-label={menuOpen ? 'Close navigation menu' : 'Open navigation menu'}
             aria-expanded={menuOpen}
             aria-controls="ad-sidebar"
-          >
-            ☰
-          </button>
-          <div className="ad-crumbs">
-            <span>Dashboards</span> / <strong>Attendance</strong>
-          </div>
-          <div className="ad-live" aria-label="Live data">
-            <i aria-hidden="true" /> Live
-          </div>
+          >☰</button>
+          <div className="ad-crumbs"><span>Dashboards</span> / <strong>Attendance</strong></div>
+          <div className="ad-live" aria-label="Live data"><i aria-hidden="true" /> Live</div>
         </header>
 
         <div className="ad-head">
           <h1>Overview</h1>
           <span className="ad-date">
             {new Date().toLocaleDateString(undefined, {
-              weekday: 'long',
-              month: 'long',
-              day: 'numeric',
+              weekday: 'long', month: 'long', day: 'numeric',
             })}
           </span>
         </div>
 
-        {/* Stat cards */}
         <section className="ad-stats" aria-label="Attendance summary">
-          <div className="ad-card">
-            <p>Total scans</p>
-            <h2>{stats.total}</h2>
-            <small className="up">↗ today</small>
-          </div>
-          <div className="ad-card">
-            <p>Time in</p>
-            <h2>{stats.timeIn}</h2>
-            <small className="up">↗ drivers clocked in</small>
-          </div>
-          <div className="ad-card">
-            <p>Time out</p>
-            <h2>{stats.timeOut}</h2>
-            <small className="down">↘ drivers clocked out</small>
-          </div>
-          <div className="ad-card">
-            <p>Currently on duty</p>
-            <h2>{stats.onDuty}</h2>
-            <small>{stats.drivers} unique drivers</small>
-          </div>
+          <div className="ad-card"><p>Total scans</p><h2>{stats.total}</h2><small className="up">↗ today</small></div>
+          <div className="ad-card"><p>Time in</p><h2>{stats.timeIn}</h2><small className="up">↗ drivers clocked in</small></div>
+          <div className="ad-card"><p>Time out</p><h2>{stats.timeOut}</h2><small className="down">↘ drivers clocked out</small></div>
+          <div className="ad-card"><p>Currently on duty</p><h2>{stats.onDuty}</h2><small>{stats.drivers} unique drivers</small></div>
         </section>
 
-        {/* Hours overview strip */}
         <section className="ad-hours-strip" aria-label="Hours at a glance">
-          <div className="ad-hours-chip">
-            <span className="label">Target / day</span>
-            <strong>8h</strong>
-          </div>
-          <div className="ad-hours-chip">
-            <span className="label">On duty</span>
-            <strong className="lime">{hoursSummary.onDuty}</strong>
-          </div>
-          <div className="ad-hours-chip">
-            <span className="label">Completed 8h</span>
-            <strong className="lime">{hoursSummary.completed}</strong>
-          </div>
-          <div className="ad-hours-chip">
-            <span className="label">Overtime</span>
-            <strong className="red">{hoursSummary.overtime}</strong>
-          </div>
-          <div className="ad-hours-chip">
-            <span className="label">Total remaining</span>
-            <strong>{formatHours(hoursSummary.totalRemaining)}</strong>
+          <div className="ad-hours-chip"><span className="label">Target / day</span><strong>8h</strong></div>
+          <div className="ad-hours-chip"><span className="label">On duty</span><strong className="lime">{hoursSummary.onDuty}</strong></div>
+          <div className="ad-hours-chip"><span className="label">Completed 8h</span><strong className="lime">{hoursSummary.completed}</strong></div>
+          <div className="ad-hours-chip"><span className="label">Overtime</span><strong className="red">{hoursSummary.overtime}</strong></div>
+          <div className="ad-hours-chip"><span className="label">Total remaining</span><strong>{formatHours(hoursSummary.totalRemaining)}</strong></div>
+        </section>
+
+        <section className="ad-hours-strip" aria-label="Geofence summary">
+          <div className="ad-hours-chip"><span className="label">Inside geofence</span><strong className="lime">{geoSummary.inside}</strong></div>
+          <div className="ad-hours-chip"><span className="label">Outside geofence</span><strong className="red">{geoSummary.outside}</strong></div>
+          <div className="ad-hours-chip"><span className="label">No GPS data</span><strong>{geoSummary.unknown}</strong></div>
+          <div className="ad-hours-chip"><span className="label">Anomalies</span><strong className="red">{anomalies.size}</strong></div>
+          <div className="ad-hours-chip ad-geo-config">
+            <span className="label">Geofence · {geofence.radiusMeters}m</span>
+            <div className="ad-geo-config-actions">
+              <button
+                className="ad-btn"
+                onClick={() => { setGeoDraft(geofence); setGeoEditorOpen(true) }}
+                title="Edit geofence center and radius"
+              >⚙ Edit geofence</button>
+            </div>
           </div>
         </section>
 
-        {/* Geo overview strip */}
-        <section className="ad-hours-strip" aria-label="Geofence summary">
-          <div className="ad-hours-chip">
-            <span className="label">Inside geofence</span>
-            <strong className="lime">{geoSummary.inside}</strong>
-          </div>
-          <div className="ad-hours-chip">
-            <span className="label">Outside geofence</span>
-            <strong className="red">{geoSummary.outside}</strong>
-          </div>
-          <div className="ad-hours-chip">
-            <span className="label">No GPS data</span>
-            <strong>{geoSummary.unknown}</strong>
-          </div>
-          <div className="ad-hours-chip">
-            <span className="label">Anomalies</span>
-            <strong className="red">{anomalies.size}</strong>
-          </div>
-        </section>
+        {autoCloseCandidates.length > 0 && canDelete && (
+          <section className="ad-autoclose-banner" role="alert">
+            <div>
+              <strong>⚠ {autoCloseCandidates.length} driver(s)</strong> currently have an open session and are outside the geofence:
+              {' '}
+              {autoCloseCandidates.map((c) => c.driver).join(', ')}.
+            </div>
+            <button
+              className="ad-btn danger"
+              disabled={autoCloseBusy}
+              onClick={() => runAutoClockOut(false)}
+            >
+              {autoCloseBusy ? 'Closing…' : 'Auto clock-out now'}
+            </button>
+          </section>
+        )}
 
         <section className="ad-grid">
-          {/* Donut */}
           <div className="ad-card ad-panel ad-panel-donut">
-            <div className="ad-panel-head">
-              <h3>Scan Overview</h3>
-            </div>
+            <div className="ad-panel-head"><h3>Scan Overview</h3></div>
             <div className="ad-donut-wrap">
               <div className="ad-donut">
                 <svg viewBox="0 0 180 180" role="img" aria-label="Scans split by type">
                   <circle cx="90" cy="90" r={R} className="ring-bg" />
                   <circle
-                    cx="90"
-                    cy="90"
-                    r={R}
-                    className="ring-fg"
+                    cx="90" cy="90" r={R} className="ring-fg"
                     strokeDasharray={`${C * inShare} ${C}`}
                     transform="rotate(-90 90 90)"
                   />
@@ -722,19 +814,14 @@ export default function AdminDashboard() {
             </div>
           </div>
 
-          {/* Recent activity */}
           <div className="ad-card ad-panel ad-panel-activity">
-            <div className="ad-panel-head">
-              <h3>Activities</h3>
-            </div>
+            <div className="ad-panel-head"><h3>Activities</h3></div>
             <ul className="ad-activity">
               {logs.slice(0, 5).map((l) => (
                 <li key={l.id}>
                   <span className={`dot ${l.action_type}`} aria-hidden="true" />
                   <div>
-                    <p>
-                      {l.driver_name} {l.action_type === 'in' ? 'timed in' : 'timed out'}
-                    </p>
+                    <p>{l.driver_name} {l.action_type === 'in' ? 'timed in' : 'timed out'}</p>
                     <small>{timeAgo(l.created_at)}</small>
                   </div>
                 </li>
@@ -744,7 +831,6 @@ export default function AdminDashboard() {
           </div>
         </section>
 
-        {/* Table */}
         <section className="ad-card ad-panel ad-table-card">
           <div className="ad-panel-head">
             <h3>Attendance log</h3>
@@ -768,25 +854,30 @@ export default function AdminDashboard() {
                   </button>
                 ))}
               </div>
-
+              <div className="ad-group-toggle" role="group" aria-label="Display mode">
+                <button
+                  className={`ad-btn ${groupByDriver ? 'on' : ''}`}
+                  onClick={() => setGroupByDriver((v) => !v)}
+                  aria-pressed={groupByDriver}
+                  title="Group rows by driver"
+                >
+                  ⇅ {groupByDriver ? 'Grouped' : 'Group by driver'}
+                </button>
+              </div>
               <div className="ad-actions">
                 <button
                   className="ad-btn export"
                   onClick={handleExport}
                   disabled={visibleLogs.length === 0}
                   title="Download current view as CSV"
-                >
-                  ⭳ Export CSV
-                </button>
+                >⭳ Export CSV</button>
                 {canDelete && (
                   <button
                     className="ad-btn danger"
                     onClick={handleClearAll}
                     disabled={clearing || logs.length === 0}
                     title="Delete all of today's attendance records"
-                  >
-                    {clearing ? 'Clearing…' : '🗑 Clear all today'}
-                  </button>
+                  >{clearing ? 'Clearing…' : '🗑 Clear all today'}</button>
                 )}
               </div>
             </div>
@@ -816,72 +907,37 @@ export default function AdminDashboard() {
                         No {filter !== 'all' ? `${filter} ` : ''}attendance records found.
                       </td>
                     </tr>
-                  ) : (
-                    visibleLogs.map((log) => {
-                      const h = driverHours.get(log.driver_name)
-                      const isAnomaly = anomalies.has(log.id)
+                  ) : groupByDriver ? (
+                    grouped.map((g) => {
+                      const isCollapsed = collapsedGroups.has(g.driver)
                       return (
-                        <tr key={log.id} className={isAnomaly ? 'ad-row-anomaly' : ''}>
-                          <td className="cell-driver">
-                            <div className="ad-driver">
-                              <span className="ad-avatar sm" aria-hidden="true">
-                                {initials(log.driver_name)}
-                              </span>
-                              <span className="ad-driver-name">{log.driver_name}</span>
-                              {isAnomaly && (
-                                <span
-                                  className="ad-anomaly-badge"
-                                  title="Duplicate or out-of-order scan — this entry was ignored for hours calculation"
-                                  aria-label="Anomaly: duplicate or out-of-order scan"
-                                >
-                                  ⚠
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                          <td data-label="Plate">{log.plate_number}</td>
-                          <td data-label="Time">
-                            {new Date(log.created_at).toLocaleTimeString()}
-                          </td>
-                          <td data-label="Action">
-                            <span className={`ad-badge ${log.action_type}`}>
-                              {log.action_type === 'in' ? 'TIME IN' : 'TIME OUT'}
-                            </span>
-                          </td>
-                          <td data-label="Location">{renderLocationCell(log)}</td>
-                          <td data-label="Worked">
-                            {h ? (
-                              <span className="ad-worked" title="Total worked today">
-                                {formatHours(h.workedHours)}
-                                {h.isOnDuty && (
-                                  <span
-                                    className="ad-live-dot"
-                                    title="Currently on duty"
-                                    aria-label="Currently on duty"
-                                  />
-                                )}
-                              </span>
-                            ) : (
-                              <span className="ad-hours-muted">—</span>
-                            )}
-                          </td>
-                          <td data-label="Hours left">{renderHoursCell(log.driver_name)}</td>
-                          <td className="cell-actions">
-                            {canDelete ? (
+                        <>
+                          <tr key={`g-${g.driver}`} className="ad-group-row">
+                            <td colSpan="8">
                               <button
-                                className="ad-row-delete"
-                                onClick={() => handleDelete(log.id)}
-                                disabled={busyId === log.id}
-                                aria-label={`Delete attendance record for ${log.driver_name}`}
-                                title="Delete this record"
+                                className="ad-group-head"
+                                onClick={() => toggleGroup(g.driver)}
+                                aria-expanded={!isCollapsed}
+                                aria-controls={`group-${g.driver}`}
                               >
-                                {busyId === log.id ? '…' : '✕'}
+                                <span className="ad-group-caret">{isCollapsed ? '▸' : '▾'}</span>
+                                <span className="ad-avatar sm" aria-hidden="true">{initials(g.driver)}</span>
+                                <span className="ad-group-name">{g.driver}</span>
+                                <span className="ad-group-meta">
+                                  {g.items.length} scan{g.items.length > 1 ? 's' : ''}
+                                  {g.hours && <> · {formatHours(g.hours.workedHours)} worked</>}
+                                  {g.hours?.isOnDuty && <span className="ad-live-dot" title="On duty" aria-label="On duty" />}
+                                </span>
+                                <span className="ad-group-hours">{renderHoursCell(g.driver)}</span>
                               </button>
-                            ) : null}
-                          </td>
-                        </tr>
+                            </td>
+                          </tr>
+                          {!isCollapsed && g.items.map((log) => renderRow(log))}
+                        </>
                       )
                     })
+                  ) : (
+                    visibleLogs.map((log) => renderRow(log))
                   )}
                 </tbody>
               </table>
@@ -889,6 +945,46 @@ export default function AdminDashboard() {
           )}
         </section>
       </main>
+
+      {/* ---------- Geofence editor modal ---------- */}
+      {geoEditorOpen && (
+        <div className="ad-modal-backdrop" onClick={() => setGeoEditorOpen(false)}>
+          <div className="ad-modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="geo-title">
+            <h3 id="geo-title">Edit geofence</h3>
+            <p className="ad-modal-help">Applied to new scans. Older records keep the geofence that was active when they were created.</p>
+            <div className="ad-modal-field">
+              <label>Latitude</label>
+              <input
+                type="number" step="any"
+                value={geoDraft.lat}
+                onChange={(e) => setGeoDraft({ ...geoDraft, lat: e.target.value })}
+              />
+            </div>
+            <div className="ad-modal-field">
+              <label>Longitude</label>
+              <input
+                type="number" step="any"
+                value={geoDraft.lng}
+                onChange={(e) => setGeoDraft({ ...geoDraft, lng: e.target.value })}
+              />
+            </div>
+            <div className="ad-modal-field">
+              <label>Radius (meters)</label>
+              <input
+                type="number" min="1"
+                value={geoDraft.radiusMeters}
+                onChange={(e) => setGeoDraft({ ...geoDraft, radiusMeters: e.target.value })}
+              />
+            </div>
+            <div className="ad-modal-actions">
+              <button className="ad-btn" onClick={() => setGeoEditorOpen(false)}>Cancel</button>
+              <button className="ad-btn export" onClick={saveGeofence} disabled={geoBusy}>
+                {geoBusy ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

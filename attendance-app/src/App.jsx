@@ -6,7 +6,6 @@ import Login from './pages/Login'
 import AdminDashboard from './pages/AdminDashboard'
 
 // ---------- GPS helper ----------
-// Resolves to null if denied/unsupported/timed out so the scan still succeeds.
 const getPosition = () =>
   new Promise((resolve) => {
     if (!navigator.geolocation) return resolve(null)
@@ -22,48 +21,101 @@ const getPosition = () =>
     )
   })
 
+// ---------- Fallback geofence if DB row missing ----------
+const FALLBACK_GEOFENCE = { lat: 14.5995, lng: 120.9842, radiusMeters: 300 }
+
 // --- DRIVER SCAN COMPONENT ---
 function DriverScan() {
   const [driverName, setDriverName] = useState('')
   const [plateNumber, setPlateNumber] = useState('')
   const [status, setStatus] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [currentGeofence, setCurrentGeofence] = useState(null)
+  const [geofenceError, setGeofenceError] = useState('')
+
+  // Load the active geofence once when the scan page opens
+  useEffect(() => {
+    let cancelled = false
+    supabase
+      .from('geofence_settings')
+      .select('*')
+      .eq('id', 1)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return
+        if (error) {
+          // Table may not exist yet — fall back gracefully
+          console.warn('geofence_settings load failed:', error.message)
+          setCurrentGeofence(FALLBACK_GEOFENCE)
+          setGeofenceError('')
+          return
+        }
+        if (data) {
+          setCurrentGeofence({
+            lat: Number(data.lat),
+            lng: Number(data.lng),
+            radiusMeters: Number(data.radius_meters),
+          })
+        } else {
+          setCurrentGeofence(FALLBACK_GEOFENCE)
+        }
+      })
+    return () => { cancelled = true }
+  }, [])
 
   const handleCheck = async (type) => {
     if (!driverName.trim() || !plateNumber.trim()) {
       return setStatus('Please enter both fields.')
     }
 
+    if (!currentGeofence) {
+      return setStatus('Still loading location settings, please try again.')
+    }
+
     setIsLoading(true)
     setStatus('Getting your location… (tap Allow if prompted)')
 
-    // Capture GPS — falls back to null if denied/unavailable
     const pos = await getPosition()
 
     setStatus('Recording attendance…')
 
+    // ---------- THE EXPANDED INSERT ----------
     const { error } = await supabase.from('attendance').insert([{
       driver_name: driverName.trim(),
       plate_number: plateNumber.trim().toUpperCase(),
-      action_type: type,
-      latitude:  pos?.latitude  ?? null,
-      longitude: pos?.longitude ?? null,
-      accuracy:  pos?.accuracy  ?? null,
+      action_type: type,                                // 'in' or 'out'
+      latitude:   pos?.latitude  ?? null,
+      longitude:  pos?.longitude ?? null,
+      accuracy:   pos?.accuracy  ?? null,
+      // Geofence snapshot for this exact scan:
+      geo_lat:    currentGeofence.lat,
+      geo_lng:    currentGeofence.lng,
+      geo_radius: currentGeofence.radiusMeters,
     }])
+    // ----------------------------------------
 
     setIsLoading(false)
 
     if (error) {
-      setStatus(`❌ Error: ${error.message}`)
-    } else {
-      setStatus(
-        pos
-          ? `✅ Successfully clocked ${type.toUpperCase()}!`
-          : `✅ Clocked ${type.toUpperCase()} (location unavailable)`
-      )
-      setDriverName('')
-      setPlateNumber('')
+      // If the SQL trigger rejected a duplicate/stray scan, show it clearly
+      const msg = error.message || ''
+      if (msg.toLowerCase().includes('already clocked in')) {
+        setStatus('❌ You are already clocked in. Please TIME OUT first.')
+      } else if (msg.toLowerCase().includes('no open clock-in')) {
+        setStatus('❌ No active TIME IN found. Please TIME IN first.')
+      } else {
+        setStatus(`❌ Error: ${msg}`)
+      }
+      return
     }
+
+    setStatus(
+      pos
+        ? `✅ Successfully clocked ${type.toUpperCase()}!`
+        : `✅ Clocked ${type.toUpperCase()} (location unavailable)`
+    )
+    setDriverName('')
+    setPlateNumber('')
   }
 
   return (
@@ -110,6 +162,12 @@ function DriverScan() {
           {status}
         </p>
       )}
+
+      {geofenceError && (
+        <p style={{ textAlign: 'center', marginTop: '10px', fontSize: '12px', color: '#999' }}>
+          {geofenceError}
+        </p>
+      )}
     </div>
   )
 }
@@ -119,7 +177,6 @@ export default function App() {
   const [session, setSession] = useState(null)
 
   useEffect(() => {
-    // Check if Admin is logged in
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session)
     })
@@ -132,20 +189,16 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Admin Routes */}
         <Route path="/admin" element={
           session ? <AdminDashboard /> : <Login />
         } />
 
-        {/* Driver Scan Route */}
         <Route path="/scan" element={<DriverScan />} />
 
-        {/* Public QR Code Display */}
         <Route path="/" element={
           <div style={{ textAlign: 'center', marginTop: '50px' }}>
             <h2>Admin Station</h2>
             <p>Print this QR code and post it on the wall.</p>
-            {/* The QR code points to the /scan route */}
             <div style={{ backgroundColor: 'white', padding: '20px', display: 'inline-block', borderRadius: '8px', marginTop: '20px' }}>
               <QRCode value={window.location.origin + '/scan'} size={200} />
             </div>
