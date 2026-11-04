@@ -6,39 +6,62 @@ export default function Login() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
 
   const handleLogin = async (e) => {
     e.preventDefault()
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    
+    setError('')
+    setLoading(true)
+
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password,
+    })
+
     if (error) {
-      setError(error.message)
-    } else {
-      navigate('/admin') // Send to dashboard on success
+      // Friendlier messages for the two most common cases
+      if (error.message.includes('Invalid login credentials')) {
+        setError('Wrong email or password.')
+      } else if (error.message.includes('Email not confirmed')) {
+        setError('Please confirm your email first (check your inbox).')
+      } else {
+        setError(error.message)
+      }
+      setLoading(false)
+      return
     }
+
+    // OPTIONAL: route by role if you store role in user metadata
+    const role = data.user?.user_metadata?.role
+    navigate(role === 'staff' ? '/staff' : '/admin')
+    setLoading(false)
   }
 
   return (
     <div style={styles.container}>
       <h2>Admin Login</h2>
       <form onSubmit={handleLogin} style={styles.form}>
-        <input 
-          type="email" 
-          placeholder="Email" 
-          value={email} 
-          onChange={(e) => setEmail(e.target.value)} 
+        <input
+          type="email"
+          placeholder="Email"
+          value={email}
+          onChange={(e) => { setEmail(e.target.value); setError('') }}
           style={styles.input}
+          required
         />
-        <input 
-          type="password" 
-          placeholder="Password" 
-          value={password} 
-          onChange={(e) => setPassword(e.target.value)} 
+        <input
+          type="password"
+          placeholder="Password"
+          value={password}
+          onChange={(e) => { setPassword(e.target.value); setError('') }}
           style={styles.input}
+          required
         />
-        {error && <p style={{color: 'red'}}>{error}</p>}
-        <button type="submit" style={styles.button}>Login</button>
+        {error && <p style={{ color: 'red', margin: 0 }}>{error}</p>}
+        <button type="submit" style={styles.button} disabled={loading}>
+          {loading ? 'Logging in…' : 'Login'}
+        </button>
       </form>
     </div>
   )

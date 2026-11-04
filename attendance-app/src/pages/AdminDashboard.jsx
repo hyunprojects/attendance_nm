@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { supabase } from '../supabaseClient'
 import { useNavigate } from 'react-router-dom'
 import './AdminDashboard.css'
@@ -14,15 +14,54 @@ const timeAgo = (iso) => {
   return `${hrs} hour${hrs > 1 ? 's' : ''} ago`
 }
 
+// Only this account can delete records
+const ADMIN_EMAIL = 'elendaday@gmail.com'
+
 export default function AdminDashboard() {
   const [logs, setLogs] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all')
   const [menuOpen, setMenuOpen] = useState(false)
-  const [busyId, setBusyId] = useState(null)   // row currently being deleted
+  const [busyId, setBusyId] = useState(null)
   const [clearing, setClearing] = useState(false)
+  const [currentUserEmail, setCurrentUserEmail] = useState(null)
   const navigate = useNavigate()
+
+  // Auth guard
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session) navigate('/')
+    })
+  }, [navigate])
+
+  // Get current user email (for delete permissions)
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      if (data?.user) setCurrentUserEmail(data.user.email)
+    })
+  }, [])
+
+  const canDelete = currentUserEmail === ADMIN_EMAIL
+
+  // Define fetchLogs BEFORE the effect that uses it (or use useCallback)
+  const fetchLogs = useCallback(async () => {
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+
+    const { data, error } = await supabase
+      .from('attendance')
+      .select('*')
+      .gte('created_at', today.toISOString())
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      console.error('Failed to fetch logs:', error.message)
+    } else if (data) {
+      setLogs(data)
+    }
+    setLoading(false)
+  }, [])
 
   useEffect(() => {
     fetchLogs()
@@ -30,29 +69,21 @@ export default function AdminDashboard() {
     const channel = supabase
       .channel('realtime-attendance')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'attendance' }, (payload) => {
-        setLogs((prev) => [payload.new, ...prev])
+        setLogs((prev) => {
+          // Avoid duplicate inserts
+          if (prev.some((l) => l.id === payload.new.id)) return prev
+          return [payload.new, ...prev]
+        })
       })
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'attendance' }, (payload) => {
         setLogs((prev) => prev.filter((l) => l.id !== payload.old.id))
       })
       .subscribe()
 
-    return () => supabase.removeChannel(channel)
-  }, [])
-
-  const fetchLogs = async () => {
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
-
-    const { data } = await supabase
-      .from('attendance')
-      .select('*')
-      .gte('created_at', today.toISOString())
-      .order('created_at', { ascending: false })
-
-    if (data) setLogs(data)
-    setLoading(false)
-  }
+    return () => {
+      supabase.removeChannel(channel)
+    }
+  }, [fetchLogs])
 
   const handleLogout = async () => {
     await supabase.auth.signOut()
@@ -82,6 +113,7 @@ export default function AdminDashboard() {
 
   // ---------- DELETE ONE ----------
   const handleDelete = async (id) => {
+    if (!canDelete) return
     if (!window.confirm('Delete this attendance record?')) return
     setBusyId(id)
     const { error } = await supabase.from('attendance').delete().eq('id', id)
@@ -95,6 +127,7 @@ export default function AdminDashboard() {
 
   // ---------- CLEAR ALL TODAY ----------
   const handleClearAll = async () => {
+    if (!canDelete) return
     if (logs.length === 0) return
     if (!window.confirm(`Delete all ${logs.length} attendance record(s) from today? This cannot be undone.`)) return
 
@@ -288,7 +321,6 @@ export default function AdminDashboard() {
                 ))}
               </div>
 
-              {/* NEW: Export + Clear buttons */}
               <div className="ad-actions">
                 <button
                   className="ad-btn export"
@@ -298,14 +330,16 @@ export default function AdminDashboard() {
                 >
                   ⭳ Export CSV
                 </button>
-                <button
-                  className="ad-btn danger"
-                  onClick={handleClearAll}
-                  disabled={clearing || logs.length === 0}
-                  title="Delete all of today's attendance records"
-                >
-                  {clearing ? 'Clearing…' : '🗑 Clear all today'}
-                </button>
+                {canDelete && (
+                  <button
+                    className="ad-btn danger"
+                    onClick={handleClearAll}
+                    disabled={clearing || logs.length === 0}
+                    title="Delete all of today's attendance records"
+                  >
+                    {clearing ? 'Clearing…' : '🗑 Clear all today'}
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -344,14 +378,16 @@ export default function AdminDashboard() {
                           </span>
                         </td>
                         <td>
-                          <button
-                            className="ad-row-delete"
-                            onClick={() => handleDelete(log.id)}
-                            disabled={busyId === log.id}
-                            title="Delete this record"
-                          >
-                            {busyId === log.id ? '…' : '✕'}
-                          </button>
+                          {canDelete ? (
+                            <button
+                              className="ad-row-delete"
+                              onClick={() => handleDelete(log.id)}
+                              disabled={busyId === log.id}
+                              title="Delete this record"
+                            >
+                              {busyId === log.id ? '…' : '✕'}
+                            </button>
+                          ) : null}
                         </td>
                       </tr>
                     ))
