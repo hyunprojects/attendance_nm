@@ -14,6 +14,69 @@ const timeAgo = (iso) => {
   return `${hrs} hour${hrs > 1 ? 's' : ''} ago`
 }
 
+// ---------- HOURS TRACKING ----------
+const DAILY_TARGET_HOURS = 8
+
+// Format a decimal hour value as "7h 32m" or "45m"
+const formatHours = (hours) => {
+  if (hours === null || hours === undefined || isNaN(hours)) return '—'
+  const totalMins = Math.max(0, Math.round(hours * 60))
+  const h = Math.floor(totalMins / 60)
+  const m = totalMins % 60
+  return h > 0 ? `${h}h ${m}m` : `${m}m`
+}
+
+// Pair TIME IN / TIME OUT events per driver and compute worked / remaining hours
+const computeDriverHours = (logs) => {
+  const now = Date.now()
+
+  const byDriver = new Map()
+  for (const log of logs) {
+    const key = log.driver_name || 'Unknown'
+    if (!byDriver.has(key)) byDriver.set(key, [])
+    byDriver.get(key).push(log)
+  }
+
+  const result = new Map()
+
+  for (const [driver, entries] of byDriver) {
+    const sorted = [...entries].sort(
+      (a, b) => new Date(a.created_at) - new Date(b.created_at)
+    )
+
+    let workedMs = 0
+    let openIn = null
+
+    for (const e of sorted) {
+      const t = new Date(e.created_at).getTime()
+      if (e.action_type === 'in') {
+        openIn = t
+      } else if (e.action_type === 'out' && openIn !== null) {
+        workedMs += Math.max(0, t - openIn)
+        openIn = null
+      }
+    }
+
+    const isOnDuty = openIn !== null
+    if (isOnDuty) workedMs += Math.max(0, now - openIn)
+
+    const workedHours = workedMs / 3_600_000
+    const remainingHours = Math.max(0, DAILY_TARGET_HOURS - workedHours)
+    const overtimeHours = Math.max(0, workedHours - DAILY_TARGET_HOURS)
+
+    result.set(driver, {
+      workedHours,
+      remainingHours,
+      overtimeHours,
+      isOnDuty,
+      clockedInAt: openIn,
+      plate: sorted[0]?.plate_number ?? '',
+    })
+  }
+
+  return result
+}
+
 // Only this account can delete records
 const ADMIN_EMAIL = 'elendaday@gmail.com'
 
@@ -26,6 +89,7 @@ export default function AdminDashboard() {
   const [busyId, setBusyId] = useState(null)
   const [clearing, setClearing] = useState(false)
   const [currentUserEmail, setCurrentUserEmail] = useState(null)
+  const [tick, setTick] = useState(0) // re-render for live elapsed time
   const navigate = useNavigate()
 
   // Auth guard
@@ -44,7 +108,12 @@ export default function AdminDashboard() {
 
   const canDelete = currentUserEmail === ADMIN_EMAIL
 
-  // Define fetchLogs BEFORE the effect that uses it (or use useCallback)
+  // Re-render every 30s so "remaining hours" ticks down live
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 30000)
+    return () => clearInterval(id)
+  }, [])
+
   const fetchLogs = useCallback(async () => {
     const today = new Date()
     today.setHours(0, 0, 0, 0)
@@ -70,7 +139,6 @@ export default function AdminDashboard() {
       .channel('realtime-attendance')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'attendance' }, (payload) => {
         setLogs((prev) => {
-          // Avoid duplicate inserts
           if (prev.some((l) => l.id === payload.new.id)) return prev
           return [payload.new, ...prev]
         })
@@ -110,6 +178,24 @@ export default function AdminDashboard() {
       return matchFilter && matchSearch
     })
   }, [logs, search, filter])
+
+  // Per-driver hours map
+  const driverHours = useMemo(() => computeDriverHours(logs), [logs, tick])
+
+  // Drivers who have completed or exceeded 8h (for stat card highlight)
+  const hoursSummary = useMemo(() => {
+    let completed = 0
+    let overtime = 0
+    let onDuty = 0
+    let totalRemaining = 0
+    for (const [, h] of driverHours) {
+      if (h.overtimeHours > 0) overtime++
+      else if (h.remainingHours <= 0) completed++
+      if (h.isOnDuty) onDuty++
+      totalRemaining += h.remainingHours
+    }
+    return { completed, overtime, onDuty, totalRemaining }
+  }, [driverHours])
 
   // ---------- DELETE ONE ----------
   const handleDelete = async (id) => {
@@ -155,15 +241,18 @@ export default function AdminDashboard() {
       return
     }
 
-    const headers = ['Driver', 'Plate Number', 'Action', 'Time', 'Date']
+    const headers = ['Driver', 'Plate Number', 'Action', 'Time', 'Date', 'Worked Hours', 'Remaining Hours']
     const rows = visibleLogs.map((l) => {
       const d = new Date(l.created_at)
+      const h = driverHours.get(l.driver_name)
       return [
         l.driver_name ?? '',
         l.plate_number ?? '',
         l.action_type === 'in' ? 'TIME IN' : 'TIME OUT',
         d.toLocaleTimeString(),
         d.toLocaleDateString(),
+        h ? formatHours(h.workedHours) : '',
+        h ? formatHours(h.remainingHours) : '',
       ]
     })
 
@@ -186,6 +275,35 @@ export default function AdminDashboard() {
   const R = 70
   const C = 2 * Math.PI * R
   const inShare = stats.total ? stats.timeIn / stats.total : 0
+
+  // Render a single driver's remaining-hours badge
+  const renderHoursCell = (driverName) => {
+    const h = driverHours.get(driverName)
+    if (!h) return <span className="ad-hours-muted">—</span>
+
+    if (h.overtimeHours > 0) {
+      return (
+        <span className="ad-hours-badge overtime" title={`Worked ${formatHours(h.workedHours)}`}>
+          +{formatHours(h.overtimeHours)} OT
+        </span>
+      )
+    }
+    if (h.remainingHours <= 0) {
+      return (
+        <span className="ad-hours-badge done" title={`Worked ${formatHours(h.workedHours)}`}>
+          Complete
+        </span>
+      )
+    }
+    return (
+      <span
+        className={`ad-hours-badge ${h.isOnDuty ? 'active' : 'idle'}`}
+        title={`Worked ${formatHours(h.workedHours)}`}
+      >
+        {formatHours(h.remainingHours)} left
+      </span>
+    )
+  }
 
   return (
     <div className="ad-shell">
@@ -253,6 +371,30 @@ export default function AdminDashboard() {
             <p>Currently on duty</p>
             <h2>{stats.onDuty}</h2>
             <small>{stats.drivers} unique drivers</small>
+          </div>
+        </section>
+
+        {/* Hours overview strip */}
+        <section className="ad-hours-strip">
+          <div className="ad-hours-chip">
+            <span className="label">Target / day</span>
+            <strong>8h</strong>
+          </div>
+          <div className="ad-hours-chip">
+            <span className="label">On duty</span>
+            <strong className="lime">{hoursSummary.onDuty}</strong>
+          </div>
+          <div className="ad-hours-chip">
+            <span className="label">Completed 8h</span>
+            <strong className="lime">{hoursSummary.completed}</strong>
+          </div>
+          <div className="ad-hours-chip">
+            <span className="label">Overtime</span>
+            <strong className="red">{hoursSummary.overtime}</strong>
+          </div>
+          <div className="ad-hours-chip">
+            <span className="label">Total remaining</span>
+            <strong>{formatHours(hoursSummary.totalRemaining)}</strong>
           </div>
         </section>
 
@@ -355,42 +497,58 @@ export default function AdminDashboard() {
                     <th>Plate number</th>
                     <th>Time</th>
                     <th>Action</th>
+                    <th>Worked</th>
+                    <th>Hours left</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
                   {visibleLogs.length === 0 ? (
-                    <tr><td colSpan="5" className="ad-empty">No attendance records found.</td></tr>
+                    <tr><td colSpan="7" className="ad-empty">No attendance records found.</td></tr>
                   ) : (
-                    visibleLogs.map((log) => (
-                      <tr key={log.id}>
-                        <td>
-                          <div className="ad-driver">
-                            <span className="ad-avatar sm">{initials(log.driver_name)}</span>
-                            {log.driver_name}
-                          </div>
-                        </td>
-                        <td>{log.plate_number}</td>
-                        <td>{new Date(log.created_at).toLocaleTimeString()}</td>
-                        <td>
-                          <span className={`ad-badge ${log.action_type}`}>
-                            {log.action_type === 'in' ? 'TIME IN' : 'TIME OUT'}
-                          </span>
-                        </td>
-                        <td>
-                          {canDelete ? (
-                            <button
-                              className="ad-row-delete"
-                              onClick={() => handleDelete(log.id)}
-                              disabled={busyId === log.id}
-                              title="Delete this record"
-                            >
-                              {busyId === log.id ? '…' : '✕'}
-                            </button>
-                          ) : null}
-                        </td>
-                      </tr>
-                    ))
+                    visibleLogs.map((log) => {
+                      const h = driverHours.get(log.driver_name)
+                      return (
+                        <tr key={log.id}>
+                          <td>
+                            <div className="ad-driver">
+                              <span className="ad-avatar sm">{initials(log.driver_name)}</span>
+                              {log.driver_name}
+                            </div>
+                          </td>
+                          <td>{log.plate_number}</td>
+                          <td>{new Date(log.created_at).toLocaleTimeString()}</td>
+                          <td>
+                            <span className={`ad-badge ${log.action_type}`}>
+                              {log.action_type === 'in' ? 'TIME IN' : 'TIME OUT'}
+                            </span>
+                          </td>
+                          <td>
+                            {h ? (
+                              <span className="ad-worked" title="Total worked today">
+                                {formatHours(h.workedHours)}
+                                {h.isOnDuty && <span className="ad-live-dot" title="Currently on duty" />}
+                              </span>
+                            ) : (
+                              <span className="ad-hours-muted">—</span>
+                            )}
+                          </td>
+                          <td>{renderHoursCell(log.driver_name)}</td>
+                          <td>
+                            {canDelete ? (
+                              <button
+                                className="ad-row-delete"
+                                onClick={() => handleDelete(log.id)}
+                                disabled={busyId === log.id}
+                                title="Delete this record"
+                              >
+                                {busyId === log.id ? '…' : '✕'}
+                              </button>
+                            ) : null}
+                          </td>
+                        </tr>
+                      )
+                    })
                   )}
                 </tbody>
               </table>
