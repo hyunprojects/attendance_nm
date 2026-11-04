@@ -24,45 +24,6 @@ const getPosition = () =>
 // ---------- Fallback geofence if DB row missing ----------
 const FALLBACK_GEOFENCE = { lat: 14.5995, lng: 120.9842, radiusMeters: 300 }
 
-// ---------- FIX: normalize name for comparisons ----------
-const normalizeName = (name = '') =>
-  name.trim().replace(/\s+/g, ' ').toLowerCase()
-
-// ---------- FIX: resolve the true open session (no "today" filter) ----------
-const resolveSession = (logs) => {
-  if (!logs || logs.length === 0) {
-    return { isOnDuty: false, openLog: null, lastLog: null, canonicalName: '', canonicalPlate: '', workedHours: 0 }
-  }
-  const sorted = [...logs].sort(
-    (a, b) => new Date(a.created_at) - new Date(b.created_at)
-  )
-  let openLog = null
-  let workedMs = 0
-  for (const e of sorted) {
-    const t = new Date(e.created_at).getTime()
-    if (e.action_type === 'in') {
-      openLog = e
-    } else if (e.action_type === 'out') {
-      if (openLog) {
-        workedMs += Math.max(0, t - new Date(openLog.created_at).getTime())
-        openLog = null
-      }
-    }
-  }
-  if (openLog) {
-    workedMs += Math.max(0, Date.now() - new Date(openLog.created_at).getTime())
-  }
-  const latest = sorted[sorted.length - 1]
-  return {
-    isOnDuty: openLog !== null,
-    openLog,
-    lastLog: latest,
-    canonicalName: latest.driver_name || '',
-    canonicalPlate: latest.plate_number || '',
-    workedHours: workedMs / 3_600_000,
-  }
-}
-
 // --- DRIVER SCAN COMPONENT ---
 function DriverScan() {
   const [driverName, setDriverName] = useState('')
@@ -73,6 +34,7 @@ function DriverScan() {
   const [currentGeofence, setCurrentGeofence] = useState(null)
   const [geofenceError, setGeofenceError] = useState('')
 
+  // Load the active geofence once when the scan page opens
   useEffect(() => {
     let cancelled = false
     supabase
@@ -101,32 +63,6 @@ function DriverScan() {
     return () => { cancelled = true }
   }, [])
 
-  const fetchDriverHistory = async (rawName) => {
-    const clean = rawName.trim()
-    if (!clean) return { logs: [], error: null }
-
-    // Look back 7 days to ensure we catch morning shifts
-    const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
-
-    // FIX: Using % wildcards in ilike. This ensures that if the driver's name 
-    // was saved with accidental extra spaces (e.g. "Roland "), it still finds it.
-    const { data, error } = await supabase
-      .from('attendance')
-      .select('*')
-      .ilike('driver_name', `%${clean}%`)
-      .gte('created_at', since)
-      .order('created_at', { ascending: true })
-
-    if (error) return { logs: [], error: error.message }
-
-    // We still strictly filter client-side using our normalize function
-    const target = normalizeName(clean)
-    const filtered = (data || []).filter(
-      (l) => normalizeName(l.driver_name) === target
-    )
-    return { logs: filtered, error: null }
-  }
-
   const setStatusMsg = (msg, type = '') => {
     setStatus(msg)
     setStatusType(type)
@@ -142,55 +78,19 @@ function DriverScan() {
     }
 
     setIsLoading(true)
-    setStatusMsg('🔎 Checking driver session…', 'info')
 
     try {
-      const { logs, error: lookupErr } = await fetchDriverHistory(driverName)
-      if (lookupErr) {
-        setStatusMsg(`❌ Lookup failed: ${lookupErr}`, 'error')
-        return
-      }
-
-      const session = resolveSession(logs)
-      const canonicalName = session.canonicalName || driverName.trim()
-      const canonicalPlate =
-        (plateNumber.trim() || session.canonicalPlate || '').toUpperCase()
-
-      if (type === 'out' && !session.isOnDuty) {
-        if (!session.lastLog) {
-          setStatusMsg(
-            `❌ No attendance records found for "${driverName.trim()}". Please TIME IN first.`,
-            'error'
-          )
-        } else {
-          const lastAt = new Date(session.lastLog.created_at).toLocaleString()
-          setStatusMsg(
-            `❌ ${canonicalName} is not currently clocked in. Last scan: ${
-              session.lastLog.action_type === 'in' ? 'TIME IN' : 'TIME OUT'
-            } on ${lastAt}. Please TIME IN first.`,
-            'error'
-          )
-        }
-        return
-      }
-
-      if (type === 'in' && session.isOnDuty) {
-        const since = new Date(session.openLog.created_at).toLocaleString()
-        setStatusMsg(
-          `ℹ️ ${canonicalName} is already clocked in since ${since}. Please TIME OUT first.`,
-          'info'
-        )
-        return
-      }
-
+      // ---------- GPS ----------
       setStatusMsg('📍 Getting your location… (tap Allow if prompted)', 'info')
       const pos = await getPosition()
 
+      // ---------- Insert Directly ----------
       setStatusMsg('💾 Recording attendance…', 'info')
 
+      // We send exactly what the user typed. The database trigger will handle the logic.
       const { error } = await supabase.from('attendance').insert([{
-        driver_name: canonicalName,
-        plate_number: canonicalPlate,
+        driver_name: driverName.trim(),
+        plate_number: plateNumber.trim().toUpperCase(),
         action_type: type,
         latitude:   pos?.latitude  ?? null,
         longitude:  pos?.longitude ?? null,
@@ -202,6 +102,7 @@ function DriverScan() {
 
       if (error) {
         const msg = error.message || ''
+        // If your SQL trigger rejects it, it will pass the error message here
         if (msg.toLowerCase().includes('already clocked in')) {
           setStatusMsg('❌ Already clocked in. Please TIME OUT first.', 'error')
         } else if (msg.toLowerCase().includes('no open clock-in')) {
@@ -211,7 +112,7 @@ function DriverScan() {
             'error'
           )
         } else {
-          setStatusMsg(`❌ Error: ${msg}`, 'error')
+          setStatusMsg(`❌ Database Error: ${msg}`, 'error')
         }
         return
       }
@@ -236,11 +137,10 @@ function DriverScan() {
     statusType === 'ok' ? '#2e7d32'
     : statusType === 'error' ? '#c62828'
     : statusType === 'info' ? '#1565c0'
-    : '#000' // Default to black
+    : '#000'
 
   return (
     <div style={{ backgroundColor: 'white', padding: '30px', borderRadius: '12px', width: '100%', maxWidth: '400px', margin: 'auto', marginTop: '50px', color: '#000' }}>
-      {/* FIX: Added color: '#000' to header so it's visible on mobile */}
       <h2 style={{ textAlign: 'center', color: '#000' }}>Driver Check-In</h2>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
@@ -249,7 +149,6 @@ function DriverScan() {
           placeholder="Driver Name"
           value={driverName}
           onChange={(e) => { setDriverName(e.target.value); setStatus('') }}
-          // FIX: Added explicit background and text color for mobile visibility
           style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', color: '#000', backgroundColor: '#fff', fontSize: '16px' }}
           disabled={isLoading}
           autoComplete="off"
@@ -259,7 +158,6 @@ function DriverScan() {
           placeholder="Plate Number"
           value={plateNumber}
           onChange={(e) => { setPlateNumber(e.target.value); setStatus('') }}
-          // FIX: Added explicit background and text color for mobile visibility
           style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', color: '#000', backgroundColor: '#fff', fontSize: '16px' }}
           disabled={isLoading}
           autoComplete="off"
