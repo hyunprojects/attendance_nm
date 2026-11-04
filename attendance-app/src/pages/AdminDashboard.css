@@ -301,6 +301,17 @@
   background: var(--card); border: 1px solid var(--line); color: var(--text);
   padding: 9px 14px; border-radius: 999px; font-size: 13px; outline: none;
 }
+/* Overtime filter active state */
+.ad-pills button.active[aria-pressed="true"]:last-child {
+  background: var(--red);
+  color: #fff;
+}
+
+/* Optional: Add a subtle red hover state for the overtime button when not active */
+.ad-pills button:last-child:hover:not(.active) {
+  color: var(--red);
+  background: rgba(255, 93, 93, 0.1);
+}
 .ad-tools input:focus { border-color: var(--lime); }
 .ad-pills { display: flex; flex-wrap: wrap; gap: 6px; }
 .ad-pills button {

@@ -320,23 +320,31 @@ export default function AdminDashboard() {
     return { total: logs.length, timeIn, timeOut, drivers, onDuty, pct }
   }, [logs])
 
+  const { driverHours, anomalies } = useMemo(
+    () => computeDriverHours(logs),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [logs, tick]
+  )
+
   const visibleLogs = useMemo(() => {
     const q = search.trim().toLowerCase()
     return logs.filter((l) => {
-      const matchFilter = filter === 'all' || l.action_type === filter
+      let matchFilter = true
+      if (filter === 'in' || filter === 'out') {
+        matchFilter = l.action_type === filter
+      } else if (filter === 'overtime') {
+        // Check if this driver has overtime hours
+        const h = driverHours.get(l.driver_name)
+        matchFilter = h ? h.overtimeHours > 0 : false
+      }
+
       const matchSearch =
         !q ||
         l.driver_name?.toLowerCase().includes(q) ||
         l.plate_number?.toLowerCase().includes(q)
       return matchFilter && matchSearch
     })
-  }, [logs, search, filter])
-
-  const { driverHours, anomalies } = useMemo(
-    () => computeDriverHours(logs),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [logs, tick]
-  )
+  }, [logs, search, filter, driverHours])
 
   const hoursSummary = useMemo(() => {
     let completed = 0
@@ -749,14 +757,14 @@ export default function AdminDashboard() {
                 aria-label="Search driver or plate"
               />
               <div className="ad-pills" role="group" aria-label="Filter by action">
-                {['all', 'in', 'out'].map((f) => (
+                {['all', 'in', 'out', 'overtime'].map((f) => (
                   <button
                     key={f}
                     className={filter === f ? 'active' : ''}
                     onClick={() => setFilter(f)}
                     aria-pressed={filter === f}
                   >
-                    {f === 'all' ? 'All' : f === 'in' ? 'Time in' : 'Time out'}
+                    {f === 'all' ? 'All' : f === 'in' ? 'Time in' : f === 'out' ? 'Time out' : 'Overtime'}
                   </button>
                 ))}
               </div>
@@ -805,7 +813,7 @@ export default function AdminDashboard() {
                   {visibleLogs.length === 0 ? (
                     <tr>
                       <td colSpan="8" className="ad-empty cell-empty">
-                        No attendance records found.
+                        No {filter !== 'all' ? `${filter} ` : ''}attendance records found.
                       </td>
                     </tr>
                   ) : (
