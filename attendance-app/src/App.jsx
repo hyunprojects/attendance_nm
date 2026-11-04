@@ -29,8 +29,6 @@ const normalizeName = (name = '') =>
   name.trim().replace(/\s+/g, ' ').toLowerCase()
 
 // ---------- FIX: resolve the true open session (no "today" filter) ----------
-// Walks the driver's history chronologically. Returns the canonical
-// driver_name (as stored in DB), the open time-in if any, and worked hours.
 const resolveSession = (logs) => {
   if (!logs || logs.length === 0) {
     return { isOnDuty: false, openLog: null, lastLog: null, canonicalName: '', canonicalPlate: '', workedHours: 0 }
@@ -43,7 +41,6 @@ const resolveSession = (logs) => {
   for (const e of sorted) {
     const t = new Date(e.created_at).getTime()
     if (e.action_type === 'in') {
-      // A second time-in while already open: keep the newest as the open session
       openLog = e
     } else if (e.action_type === 'out') {
       if (openLog) {
@@ -76,7 +73,6 @@ function DriverScan() {
   const [currentGeofence, setCurrentGeofence] = useState(null)
   const [geofenceError, setGeofenceError] = useState('')
 
-  // Load the active geofence once when the scan page opens
   useEffect(() => {
     let cancelled = false
     supabase
@@ -105,25 +101,25 @@ function DriverScan() {
     return () => { cancelled = true }
   }, [])
 
-  // ---------- FIX: look up the driver's full history (case-insensitive) ----------
-  // No "today" cutoff — we look back 7 days so night shifts / stale sessions
-  // still resolve. We ALSO do a client-side normalized compare so trailing
-  // spaces, double spaces, or case differences don't break the match.
   const fetchDriverHistory = async (rawName) => {
     const clean = rawName.trim()
     if (!clean) return { logs: [], error: null }
 
+    // Look back 7 days to ensure we catch morning shifts
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
 
+    // FIX: Using % wildcards in ilike. This ensures that if the driver's name 
+    // was saved with accidental extra spaces (e.g. "Roland "), it still finds it.
     const { data, error } = await supabase
       .from('attendance')
       .select('*')
-      .ilike('driver_name', clean)   // FIX: case-insensitive
-      .gte('created_at', since)      // FIX: 7-day window, not "today"
+      .ilike('driver_name', `%${clean}%`)
+      .gte('created_at', since)
       .order('created_at', { ascending: true })
 
     if (error) return { logs: [], error: error.message }
 
+    // We still strictly filter client-side using our normalize function
     const target = normalizeName(clean)
     const filtered = (data || []).filter(
       (l) => normalizeName(l.driver_name) === target
@@ -149,7 +145,6 @@ function DriverScan() {
     setStatusMsg('🔎 Checking driver session…', 'info')
 
     try {
-      // ---------- FIX: pre-flight session check ----------
       const { logs, error: lookupErr } = await fetchDriverHistory(driverName)
       if (lookupErr) {
         setStatusMsg(`❌ Lookup failed: ${lookupErr}`, 'error')
@@ -157,10 +152,6 @@ function DriverScan() {
       }
 
       const session = resolveSession(logs)
-
-      // Use the canonical name/plate exactly as stored in the DB so the
-      // SQL trigger's name comparison succeeds even when the user typed it
-      // in a different case.
       const canonicalName = session.canonicalName || driverName.trim()
       const canonicalPlate =
         (plateNumber.trim() || session.canonicalPlate || '').toUpperCase()
@@ -192,15 +183,13 @@ function DriverScan() {
         return
       }
 
-      // ---------- GPS ----------
       setStatusMsg('📍 Getting your location… (tap Allow if prompted)', 'info')
       const pos = await getPosition()
 
-      // ---------- Insert ----------
       setStatusMsg('💾 Recording attendance…', 'info')
 
       const { error } = await supabase.from('attendance').insert([{
-        driver_name: canonicalName,                 // FIX: canonical casing
+        driver_name: canonicalName,
         plate_number: canonicalPlate,
         action_type: type,
         latitude:   pos?.latitude  ?? null,
@@ -247,11 +236,12 @@ function DriverScan() {
     statusType === 'ok' ? '#2e7d32'
     : statusType === 'error' ? '#c62828'
     : statusType === 'info' ? '#1565c0'
-    : '#333'
+    : '#000' // Default to black
 
   return (
-    <div style={{ backgroundColor: 'white', padding: '30px', borderRadius: '12px', width: '100%', maxWidth: '400px', margin: 'auto', marginTop: '50px' }}>
-      <h2 style={{ textAlign: 'center' }}>Driver Check-In</h2>
+    <div style={{ backgroundColor: 'white', padding: '30px', borderRadius: '12px', width: '100%', maxWidth: '400px', margin: 'auto', marginTop: '50px', color: '#000' }}>
+      {/* FIX: Added color: '#000' to header so it's visible on mobile */}
+      <h2 style={{ textAlign: 'center', color: '#000' }}>Driver Check-In</h2>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
         <input
@@ -259,7 +249,8 @@ function DriverScan() {
           placeholder="Driver Name"
           value={driverName}
           onChange={(e) => { setDriverName(e.target.value); setStatus('') }}
-          style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc' }}
+          // FIX: Added explicit background and text color for mobile visibility
+          style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', color: '#000', backgroundColor: '#fff', fontSize: '16px' }}
           disabled={isLoading}
           autoComplete="off"
         />
@@ -268,7 +259,8 @@ function DriverScan() {
           placeholder="Plate Number"
           value={plateNumber}
           onChange={(e) => { setPlateNumber(e.target.value); setStatus('') }}
-          style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc' }}
+          // FIX: Added explicit background and text color for mobile visibility
+          style={{ padding: '12px', borderRadius: '6px', border: '1px solid #ccc', color: '#000', backgroundColor: '#fff', fontSize: '16px' }}
           disabled={isLoading}
           autoComplete="off"
         />
@@ -329,7 +321,7 @@ export default function App() {
         <Route path="/scan" element={<DriverScan />} />
 
         <Route path="/" element={
-          <div style={{ textAlign: 'center', marginTop: '50px' }}>
+          <div style={{ textAlign: 'center', marginTop: '50px', color: '#000' }}>
             <h2>Admin Station</h2>
             <p>Print this QR code and post it on the wall.</p>
             <div style={{ backgroundColor: 'white', padding: '20px', display: 'inline-block', borderRadius: '8px', marginTop: '20px' }}>
