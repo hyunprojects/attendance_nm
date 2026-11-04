@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../supabaseClient'
 import { useNavigate } from 'react-router-dom'
 import './AdminDashboard.css'
@@ -17,7 +17,6 @@ const timeAgo = (iso) => {
 // ---------- HOURS TRACKING ----------
 const DAILY_TARGET_HOURS = 8
 
-// Format a decimal hour value as "7h 32m" or "45m"
 const formatHours = (hours) => {
   if (hours === null || hours === undefined || isNaN(hours)) return '—'
   const totalMins = Math.max(0, Math.round(hours * 60))
@@ -26,7 +25,13 @@ const formatHours = (hours) => {
   return h > 0 ? `${h}h ${m}m` : `${m}m`
 }
 
-// Pair TIME IN / TIME OUT events per driver and compute worked / remaining hours
+/**
+ * Pair TIME IN / TIME OUT events per driver and compute worked / remaining hours.
+ * Also flags anomalies:
+ *  - double-in (in while already in)
+ *  - stray-out (out with no matching in)
+ * Each anomaly is attached to the entry id it occurred on.
+ */
 const computeDriverHours = (logs) => {
   const now = Date.now()
 
@@ -38,6 +43,7 @@ const computeDriverHours = (logs) => {
   }
 
   const result = new Map()
+  const anomalies = new Set() // entry ids flagged as duplicate/out-of-order
 
   for (const [driver, entries] of byDriver) {
     const sorted = [...entries].sort(
@@ -46,14 +52,28 @@ const computeDriverHours = (logs) => {
 
     let workedMs = 0
     let openIn = null
+    let openInId = null
 
     for (const e of sorted) {
       const t = new Date(e.created_at).getTime()
+
       if (e.action_type === 'in') {
+        if (openIn !== null) {
+          // Double-in: driver already clocked in. Flag this new entry.
+          anomalies.add(e.id)
+          continue
+        }
         openIn = t
-      } else if (e.action_type === 'out' && openIn !== null) {
+        openInId = e.id
+      } else if (e.action_type === 'out') {
+        if (openIn === null) {
+          // Stray out: no matching in. Flag it.
+          anomalies.add(e.id)
+          continue
+        }
         workedMs += Math.max(0, t - openIn)
         openIn = null
+        openInId = null
       }
     }
 
@@ -70,15 +90,69 @@ const computeDriverHours = (logs) => {
       overtimeHours,
       isOnDuty,
       clockedInAt: openIn,
+      clockedInId: openInId,
       plate: sorted[0]?.plate_number ?? '',
     })
   }
 
-  return result
+  return { driverHours: result, anomalies }
 }
 
 // Only this account can delete records
 const ADMIN_EMAIL = 'elendaday@gmail.com'
+
+// Geofence: warehouse / base location. Adjust to your real coords.
+const GEOFENCE = {
+  lat: 14.5995,
+  lng: 120.9842,
+  radiusMeters: 300,
+}
+
+// Haversine distance in meters
+const haversine = (lat1, lon1, lat2, lon2) => {
+  const R = 6371000
+  const toRad = (d) => (d * Math.PI) / 180
+  const dLat = toRad(lat2 - lat1)
+  const dLon = toRad(lon2 - lon1)
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2
+  return 2 * R * Math.asin(Math.sqrt(a))
+}
+
+const isInsideGeofence = (lat, lng) => {
+  if (lat == null || lng == null) return null // unknown
+  return haversine(lat, lng, GEOFENCE.lat, GEOFENCE.lng) <= GEOFENCE.radiusMeters
+}
+
+const mapsLink = (lat, lng) =>
+  lat != null && lng != null
+    ? `https://www.google.com/maps?q=${lat},${lng}`
+    : null
+
+// ---------- TOAST HOOK ----------
+function useToasts() {
+  const [toasts, setToasts] = useState([])
+  const idRef = useRef(0)
+
+  const dismiss = useCallback((id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id))
+  }, [])
+
+  const push = useCallback(
+    (message, type = 'info', duration = 3500) => {
+      const id = ++idRef.current
+      setToasts((prev) => [...prev, { id, message, type }])
+      if (duration > 0) {
+        setTimeout(() => dismiss(id), duration)
+      }
+      return id
+    },
+    [dismiss]
+  )
+
+  return { toasts, push, dismiss }
+}
 
 export default function AdminDashboard() {
   const [logs, setLogs] = useState([])
@@ -89,8 +163,15 @@ export default function AdminDashboard() {
   const [busyId, setBusyId] = useState(null)
   const [clearing, setClearing] = useState(false)
   const [currentUserEmail, setCurrentUserEmail] = useState(null)
-  const [tick, setTick] = useState(0) // re-render for live elapsed time
+  const [tick, setTick] = useState(0)
   const navigate = useNavigate()
+
+  // Toast system
+  const { toasts, push: toast, dismiss: dismissToast } = useToasts()
+
+  // Refs for focus management
+  const sidebarRef = useRef(null)
+  const burgerRef = useRef(null)
 
   // Auth guard
   useEffect(() => {
@@ -126,32 +207,93 @@ export default function AdminDashboard() {
 
     if (error) {
       console.error('Failed to fetch logs:', error.message)
+      toast('Failed to load attendance logs.', 'error')
     } else if (data) {
       setLogs(data)
     }
     setLoading(false)
-  }, [])
+  }, [toast])
 
   useEffect(() => {
     fetchLogs()
 
     const channel = supabase
       .channel('realtime-attendance')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'attendance' }, (payload) => {
-        setLogs((prev) => {
-          if (prev.some((l) => l.id === payload.new.id)) return prev
-          return [payload.new, ...prev]
-        })
-      })
-      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'attendance' }, (payload) => {
-        setLogs((prev) => prev.filter((l) => l.id !== payload.old.id))
-      })
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'attendance' },
+        (payload) => {
+          setLogs((prev) => {
+            if (prev.some((l) => l.id === payload.new.id)) return prev
+            toast(
+              `${payload.new.driver_name} ${
+                payload.new.action_type === 'in' ? 'timed in' : 'timed out'
+              }`,
+              payload.new.action_type === 'in' ? 'success' : 'info'
+            )
+            return [payload.new, ...prev]
+          })
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'DELETE', schema: 'public', table: 'attendance' },
+        (payload) => {
+          setLogs((prev) => prev.filter((l) => l.id !== payload.old.id))
+        }
+      )
       .subscribe()
 
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [fetchLogs])
+  }, [fetchLogs, toast])
+
+  // ---------- KEYBOARD ACCESSIBILITY ----------
+  // ESC closes mobile sidebar; focus trap while open; ESC closes toasts.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && menuOpen) {
+        setMenuOpen(false)
+        burgerRef.current?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [menuOpen])
+
+  // Focus trap for the mobile sidebar
+  useEffect(() => {
+    if (!menuOpen) return
+    const node = sidebarRef.current
+    if (!node) return
+
+    const focusable = node.querySelectorAll(
+      'button:not(:disabled), [href], input, [tabindex]:not([tabindex="-1"])'
+    )
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+
+    const trap = (e) => {
+      if (e.key !== 'Tab') return
+      if (focusable.length === 0) {
+        e.preventDefault()
+        return
+      }
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault()
+        first.focus()
+      }
+    }
+
+    node.addEventListener('keydown', trap)
+    first?.focus()
+
+    return () => node.removeEventListener('keydown', trap)
+  }, [menuOpen])
 
   const handleLogout = async () => {
     await supabase.auth.signOut()
@@ -179,10 +321,12 @@ export default function AdminDashboard() {
     })
   }, [logs, search, filter])
 
-  // Per-driver hours map
-  const driverHours = useMemo(() => computeDriverHours(logs), [logs, tick])
+  // Per-driver hours map + anomaly set
+  const { driverHours, anomalies } = useMemo(
+    () => computeDriverHours(logs),
+    [logs, tick]
+  )
 
-  // Drivers who have completed or exceeded 8h (for stat card highlight)
   const hoursSummary = useMemo(() => {
     let completed = 0
     let overtime = 0
@@ -197,6 +341,19 @@ export default function AdminDashboard() {
     return { completed, overtime, onDuty, totalRemaining }
   }, [driverHours])
 
+  const geoSummary = useMemo(() => {
+    let inside = 0
+    let outside = 0
+    let unknown = 0
+    for (const l of logs) {
+      const insideGeo = isInsideGeofence(l.latitude, l.longitude)
+      if (insideGeo === true) inside++
+      else if (insideGeo === false) outside++
+      else unknown++
+    }
+    return { inside, outside, unknown }
+  }, [logs])
+
   // ---------- DELETE ONE ----------
   const handleDelete = async (id) => {
     if (!canDelete) return
@@ -204,9 +361,10 @@ export default function AdminDashboard() {
     setBusyId(id)
     const { error } = await supabase.from('attendance').delete().eq('id', id)
     if (error) {
-      alert('Failed to delete: ' + error.message)
+      toast('Failed to delete: ' + error.message, 'error')
     } else {
       setLogs((prev) => prev.filter((l) => l.id !== id))
+      toast('Record deleted.', 'success')
     }
     setBusyId(null)
   }
@@ -215,21 +373,23 @@ export default function AdminDashboard() {
   const handleClearAll = async () => {
     if (!canDelete) return
     if (logs.length === 0) return
-    if (!window.confirm(`Delete all ${logs.length} attendance record(s) from today? This cannot be undone.`)) return
+    if (
+      !window.confirm(
+        `Delete all ${logs.length} attendance record(s) from today? This cannot be undone.`
+      )
+    )
+      return
 
     setClearing(true)
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
-
-    const { error } = await supabase
-      .from('attendance')
-      .delete()
-      .gte('created_at', today.toISOString())
+    // Snapshot ids so new scans arriving mid-operation aren't deleted
+    const ids = logs.map((l) => l.id)
+    const { error } = await supabase.from('attendance').delete().in('id', ids)
 
     if (error) {
-      alert('Failed to clear: ' + error.message)
+      toast('Failed to clear: ' + error.message, 'error')
     } else {
       setLogs([])
+      toast(`Cleared ${ids.length} record(s).`, 'success')
     }
     setClearing(false)
   }
@@ -237,14 +397,27 @@ export default function AdminDashboard() {
   // ---------- EXPORT CSV ----------
   const handleExport = () => {
     if (visibleLogs.length === 0) {
-      alert('Nothing to export.')
+      toast('Nothing to export.', 'info')
       return
     }
 
-    const headers = ['Driver', 'Plate Number', 'Action', 'Time', 'Date', 'Worked Hours', 'Remaining Hours']
+    const headers = [
+      'Driver',
+      'Plate Number',
+      'Action',
+      'Time',
+      'Date',
+      'Worked Hours',
+      'Remaining Hours',
+      'Latitude',
+      'Longitude',
+      'Location Status',
+      'Anomaly',
+    ]
     const rows = visibleLogs.map((l) => {
       const d = new Date(l.created_at)
       const h = driverHours.get(l.driver_name)
+      const inside = isInsideGeofence(l.latitude, l.longitude)
       return [
         l.driver_name ?? '',
         l.plate_number ?? '',
@@ -253,13 +426,21 @@ export default function AdminDashboard() {
         d.toLocaleDateString(),
         h ? formatHours(h.workedHours) : '',
         h ? formatHours(h.remainingHours) : '',
+        l.latitude ?? '',
+        l.longitude ?? '',
+        inside === null ? 'Unknown' : inside ? 'Inside geofence' : 'Outside geofence',
+        anomalies.has(l.id) ? 'Duplicate / out-of-order' : '',
       ]
     })
 
     const escape = (val) => `"${String(val).replace(/"/g, '""')}"`
-    const csv = [headers, ...rows].map((r) => r.map(escape).join(',')).join('\r\n')
+    const csv = [headers, ...rows]
+      .map((r) => r.map(escape).join(','))
+      .join('\r\n')
 
-    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
+    const blob = new Blob(['\uFEFF' + csv], {
+      type: 'text/csv;charset=utf-8;',
+    })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     const stamp = new Date().toISOString().slice(0, 10)
@@ -269,6 +450,7 @@ export default function AdminDashboard() {
     a.click()
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
+    toast(`Exported ${rows.length} row(s).`, 'success')
   }
 
   // Donut chart math
@@ -283,14 +465,20 @@ export default function AdminDashboard() {
 
     if (h.overtimeHours > 0) {
       return (
-        <span className="ad-hours-badge overtime" title={`Worked ${formatHours(h.workedHours)}`}>
+        <span
+          className="ad-hours-badge overtime"
+          title={`Worked ${formatHours(h.workedHours)}`}
+        >
           +{formatHours(h.overtimeHours)} OT
         </span>
       )
     }
     if (h.remainingHours <= 0) {
       return (
-        <span className="ad-hours-badge done" title={`Worked ${formatHours(h.workedHours)}`}>
+        <span
+          className="ad-hours-badge done"
+          title={`Worked ${formatHours(h.workedHours)}`}
+        >
           Complete
         </span>
       )
@@ -305,23 +493,74 @@ export default function AdminDashboard() {
     )
   }
 
+  const renderLocationCell = (log) => {
+    const inside = isInsideGeofence(log.latitude, log.longitude)
+    const link = mapsLink(log.latitude, log.longitude)
+
+    if (inside === null) {
+      return <span className="ad-geo-muted" title="No GPS data captured">No GPS</span>
+    }
+
+    const cls = inside ? 'inside' : 'outside'
+    const label = inside ? 'Inside' : 'Outside'
+    const tip = inside
+      ? 'Within geofence'
+      : `Outside geofence (${Math.round(
+          haversine(log.latitude, log.longitude, GEOFENCE.lat, GEOFENCE.lng)
+        )}m away)`
+
+    return (
+      <a
+        className={`ad-geo-pill ${cls}`}
+        href={link}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={tip}
+        aria-label={`${label} geofence — open location in Google Maps`}
+      >
+        <i aria-hidden="true" /> {label}
+      </a>
+    )
+  }
+
   return (
     <div className="ad-shell">
+      {/* ---------- Toasts ---------- */}
+      <div className="ad-toasts" role="status" aria-live="polite">
+        {toasts.map((t) => (
+          <div key={t.id} className={`ad-toast ${t.type}`}>
+            <span>{t.message}</span>
+            <button
+              className="ad-toast-close"
+              onClick={() => dismissToast(t.id)}
+              aria-label="Dismiss notification"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
+
       {/* ---------- Sidebar ---------- */}
-      <aside className={`ad-sidebar ${menuOpen ? 'open' : ''}`}>
+      <aside
+        ref={sidebarRef}
+        className={`ad-sidebar ${menuOpen ? 'open' : ''}`}
+        aria-hidden={!menuOpen ? undefined : false}
+        aria-label="Main navigation"
+      >
         <div className="ad-brand">
-          <span className="ad-brand-mark">N</span>
+          <span className="ad-brand-mark" aria-hidden="true">N</span>
           <span>NEMINTSCO</span>
         </div>
 
         <div className="ad-user">
-          <div className="ad-avatar">AD</div>
+          <div className="ad-avatar" aria-hidden="true">AD</div>
           <span>Admin</span>
         </div>
 
         <p className="ad-nav-label">DASHBOARDS</p>
         <nav className="ad-nav">
-          <button className="active">▦ Attendance</button>
+          <button className="active" aria-current="page">▦ Attendance</button>
           <button disabled>₱ Revenue</button>
           <button disabled>🚕 Drivers</button>
         </nav>
@@ -336,22 +575,37 @@ export default function AdminDashboard() {
       {/* ---------- Main ---------- */}
       <main className="ad-main">
         <header className="ad-topbar">
-          <button className="ad-burger" onClick={() => setMenuOpen((v) => !v)}>☰</button>
+          <button
+            ref={burgerRef}
+            className="ad-burger"
+            onClick={() => setMenuOpen((v) => !v)}
+            aria-label={menuOpen ? 'Close navigation menu' : 'Open navigation menu'}
+            aria-expanded={menuOpen}
+            aria-controls="ad-sidebar"
+          >
+            ☰
+          </button>
           <div className="ad-crumbs">
             <span>Dashboards</span> / <strong>Attendance</strong>
           </div>
-          <div className="ad-live"><i /> Live</div>
+          <div className="ad-live" aria-label="Live data">
+            <i aria-hidden="true" /> Live
+          </div>
         </header>
 
         <div className="ad-head">
           <h1>Overview</h1>
           <span className="ad-date">
-            {new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}
+            {new Date().toLocaleDateString(undefined, {
+              weekday: 'long',
+              month: 'long',
+              day: 'numeric',
+            })}
           </span>
         </div>
 
         {/* Stat cards */}
-        <section className="ad-stats">
+        <section className="ad-stats" aria-label="Attendance summary">
           <div className="ad-card">
             <p>Total scans</p>
             <h2>{stats.total}</h2>
@@ -375,7 +629,7 @@ export default function AdminDashboard() {
         </section>
 
         {/* Hours overview strip */}
-        <section className="ad-hours-strip">
+        <section className="ad-hours-strip" aria-label="Hours at a glance">
           <div className="ad-hours-chip">
             <span className="label">Target / day</span>
             <strong>8h</strong>
@@ -398,16 +652,40 @@ export default function AdminDashboard() {
           </div>
         </section>
 
+        {/* Geo overview strip */}
+        <section className="ad-hours-strip" aria-label="Geofence summary">
+          <div className="ad-hours-chip">
+            <span className="label">Inside geofence</span>
+            <strong className="lime">{geoSummary.inside}</strong>
+          </div>
+          <div className="ad-hours-chip">
+            <span className="label">Outside geofence</span>
+            <strong className="red">{geoSummary.outside}</strong>
+          </div>
+          <div className="ad-hours-chip">
+            <span className="label">No GPS data</span>
+            <strong>{geoSummary.unknown}</strong>
+          </div>
+          <div className="ad-hours-chip">
+            <span className="label">Anomalies</span>
+            <strong className="red">{anomalies.size}</strong>
+          </div>
+        </section>
+
         <section className="ad-grid">
           {/* Donut */}
           <div className="ad-card ad-panel">
-            <div className="ad-panel-head"><h3>Scan Overview</h3></div>
+            <div className="ad-panel-head">
+              <h3>Scan Overview</h3>
+            </div>
             <div className="ad-donut-wrap">
               <div className="ad-donut">
-                <svg viewBox="0 0 180 180">
+                <svg viewBox="0 0 180 180" role="img" aria-label="Scans split by type">
                   <circle cx="90" cy="90" r={R} className="ring-bg" />
                   <circle
-                    cx="90" cy="90" r={R}
+                    cx="90"
+                    cy="90"
+                    r={R}
                     className="ring-fg"
                     strokeDasharray={`${C * inShare} ${C}`}
                     transform="rotate(-90 90 90)"
@@ -419,22 +697,27 @@ export default function AdminDashboard() {
                 </div>
               </div>
               <ul className="ad-legend">
-                <li><i className="lime" /> Time in <b>{stats.timeIn}</b></li>
-                <li><i className="dim" /> Time out <b>{stats.timeOut}</b></li>
-                <li><i className="mid" /> Clock-out rate <b>{stats.pct}%</b></li>
+                <li><i className="lime" aria-hidden="true" /> Time in <b>{stats.timeIn}</b></li>
+                <li><i className="dim" aria-hidden="true" /> Time out <b>{stats.timeOut}</b></li>
+                <li><i className="mid" aria-hidden="true" /> Clock-out rate <b>{stats.pct}%</b></li>
               </ul>
             </div>
           </div>
 
           {/* Recent activity */}
           <div className="ad-card ad-panel">
-            <div className="ad-panel-head"><h3>Activities</h3></div>
+            <div className="ad-panel-head">
+              <h3>Activities</h3>
+            </div>
             <ul className="ad-activity">
               {logs.slice(0, 5).map((l) => (
                 <li key={l.id}>
-                  <span className={`dot ${l.action_type}`} />
+                  <span className={`dot ${l.action_type}`} aria-hidden="true" />
                   <div>
-                    <p>{l.driver_name} {l.action_type === 'in' ? 'timed in' : 'timed out'}</p>
+                    <p>
+                      {l.driver_name}{' '}
+                      {l.action_type === 'in' ? 'timed in' : 'timed out'}
+                    </p>
                     <small>{timeAgo(l.created_at)}</small>
                   </div>
                 </li>
@@ -454,10 +737,16 @@ export default function AdminDashboard() {
                 placeholder="Search driver or plate…"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
+                aria-label="Search driver or plate"
               />
-              <div className="ad-pills">
+              <div className="ad-pills" role="group" aria-label="Filter by action">
                 {['all', 'in', 'out'].map((f) => (
-                  <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>
+                  <button
+                    key={f}
+                    className={filter === f ? 'active' : ''}
+                    onClick={() => setFilter(f)}
+                    aria-pressed={filter === f}
+                  >
                     {f === 'all' ? 'All' : f === 'in' ? 'Time in' : 'Time out'}
                   </button>
                 ))}
@@ -493,27 +782,44 @@ export default function AdminDashboard() {
               <table className="ad-table">
                 <thead>
                   <tr>
-                    <th>Driver</th>
-                    <th>Plate number</th>
-                    <th>Time</th>
-                    <th>Action</th>
-                    <th>Worked</th>
-                    <th>Hours left</th>
-                    <th></th>
+                    <th scope="col">Driver</th>
+                    <th scope="col">Plate number</th>
+                    <th scope="col">Time</th>
+                    <th scope="col">Action</th>
+                    <th scope="col">Location</th>
+                    <th scope="col">Worked</th>
+                    <th scope="col">Hours left</th>
+                    <th scope="col"><span className="sr-only">Actions</span></th>
                   </tr>
                 </thead>
                 <tbody>
                   {visibleLogs.length === 0 ? (
-                    <tr><td colSpan="7" className="ad-empty">No attendance records found.</td></tr>
+                    <tr>
+                      <td colSpan="8" className="ad-empty">
+                        No attendance records found.
+                      </td>
+                    </tr>
                   ) : (
                     visibleLogs.map((log) => {
                       const h = driverHours.get(log.driver_name)
+                      const isAnomaly = anomalies.has(log.id)
                       return (
-                        <tr key={log.id}>
+                        <tr key={log.id} className={isAnomaly ? 'ad-row-anomaly' : ''}>
                           <td>
                             <div className="ad-driver">
-                              <span className="ad-avatar sm">{initials(log.driver_name)}</span>
-                              {log.driver_name}
+                              <span className="ad-avatar sm" aria-hidden="true">
+                                {initials(log.driver_name)}
+                              </span>
+                              <span>{log.driver_name}</span>
+                              {isAnomaly && (
+                                <span
+                                  className="ad-anomaly-badge"
+                                  title="Duplicate or out-of-order scan — this entry was ignored for hours calculation"
+                                  aria-label="Anomaly: duplicate or out-of-order scan"
+                                >
+                                  ⚠
+                                </span>
+                              )}
                             </div>
                           </td>
                           <td>{log.plate_number}</td>
@@ -523,11 +829,18 @@ export default function AdminDashboard() {
                               {log.action_type === 'in' ? 'TIME IN' : 'TIME OUT'}
                             </span>
                           </td>
+                          <td>{renderLocationCell(log)}</td>
                           <td>
                             {h ? (
                               <span className="ad-worked" title="Total worked today">
                                 {formatHours(h.workedHours)}
-                                {h.isOnDuty && <span className="ad-live-dot" title="Currently on duty" />}
+                                {h.isOnDuty && (
+                                  <span
+                                    className="ad-live-dot"
+                                    title="Currently on duty"
+                                    aria-label="Currently on duty"
+                                  />
+                                )}
                               </span>
                             ) : (
                               <span className="ad-hours-muted">—</span>
@@ -540,6 +853,7 @@ export default function AdminDashboard() {
                                 className="ad-row-delete"
                                 onClick={() => handleDelete(log.id)}
                                 disabled={busyId === log.id}
+                                aria-label={`Delete attendance record for ${log.driver_name}`}
                                 title="Delete this record"
                               >
                                 {busyId === log.id ? '…' : '✕'}
