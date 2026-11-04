@@ -30,7 +30,6 @@ const formatHours = (hours) => {
  * Also flags anomalies:
  *  - double-in (in while already in)
  *  - stray-out (out with no matching in)
- * Each anomaly is attached to the entry id it occurred on.
  */
 const computeDriverHours = (logs) => {
   const now = Date.now()
@@ -43,7 +42,7 @@ const computeDriverHours = (logs) => {
   }
 
   const result = new Map()
-  const anomalies = new Set() // entry ids flagged as duplicate/out-of-order
+  const anomalies = new Set()
 
   for (const [driver, entries] of byDriver) {
     const sorted = [...entries].sort(
@@ -59,7 +58,6 @@ const computeDriverHours = (logs) => {
 
       if (e.action_type === 'in') {
         if (openIn !== null) {
-          // Double-in: driver already clocked in. Flag this new entry.
           anomalies.add(e.id)
           continue
         }
@@ -67,7 +65,6 @@ const computeDriverHours = (logs) => {
         openInId = e.id
       } else if (e.action_type === 'out') {
         if (openIn === null) {
-          // Stray out: no matching in. Flag it.
           anomalies.add(e.id)
           continue
         }
@@ -121,7 +118,7 @@ const haversine = (lat1, lon1, lat2, lon2) => {
 }
 
 const isInsideGeofence = (lat, lng) => {
-  if (lat == null || lng == null) return null // unknown
+  if (lat == null || lng == null) return null
   return haversine(lat, lng, GEOFENCE.lat, GEOFENCE.lng) <= GEOFENCE.radiusMeters
 }
 
@@ -166,10 +163,8 @@ export default function AdminDashboard() {
   const [tick, setTick] = useState(0)
   const navigate = useNavigate()
 
-  // Toast system
   const { toasts, push: toast, dismiss: dismissToast } = useToasts()
 
-  // Refs for focus management
   const sidebarRef = useRef(null)
   const burgerRef = useRef(null)
 
@@ -180,7 +175,7 @@ export default function AdminDashboard() {
     })
   }, [navigate])
 
-  // Get current user email (for delete permissions)
+  // Current user email (for delete permissions)
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
       if (data?.user) setCurrentUserEmail(data.user.email)
@@ -249,8 +244,24 @@ export default function AdminDashboard() {
     }
   }, [fetchLogs, toast])
 
+  // ---------- MOBILE MENU: scroll lock + auto-close on desktop ----------
+  useEffect(() => {
+    document.body.style.overflow = menuOpen ? 'hidden' : ''
+    return () => {
+      document.body.style.overflow = ''
+    }
+  }, [menuOpen])
+
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 761px)')
+    const onChange = (e) => {
+      if (e.matches) setMenuOpen(false)
+    }
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
   // ---------- KEYBOARD ACCESSIBILITY ----------
-  // ESC closes mobile sidebar; focus trap while open; ESC closes toasts.
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === 'Escape' && menuOpen) {
@@ -321,9 +332,9 @@ export default function AdminDashboard() {
     })
   }, [logs, search, filter])
 
-  // Per-driver hours map + anomaly set
   const { driverHours, anomalies } = useMemo(
     () => computeDriverHours(logs),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [logs, tick]
   )
 
@@ -381,7 +392,6 @@ export default function AdminDashboard() {
       return
 
     setClearing(true)
-    // Snapshot ids so new scans arriving mid-operation aren't deleted
     const ids = logs.map((l) => l.id)
     const { error } = await supabase.from('attendance').delete().in('id', ids)
 
@@ -438,9 +448,7 @@ export default function AdminDashboard() {
       .map((r) => r.map(escape).join(','))
       .join('\r\n')
 
-    const blob = new Blob(['\uFEFF' + csv], {
-      type: 'text/csv;charset=utf-8;',
-    })
+    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     const stamp = new Date().toISOString().slice(0, 10)
@@ -458,27 +466,20 @@ export default function AdminDashboard() {
   const C = 2 * Math.PI * R
   const inShare = stats.total ? stats.timeIn / stats.total : 0
 
-  // Render a single driver's remaining-hours badge
   const renderHoursCell = (driverName) => {
     const h = driverHours.get(driverName)
     if (!h) return <span className="ad-hours-muted">—</span>
 
     if (h.overtimeHours > 0) {
       return (
-        <span
-          className="ad-hours-badge overtime"
-          title={`Worked ${formatHours(h.workedHours)}`}
-        >
+        <span className="ad-hours-badge overtime" title={`Worked ${formatHours(h.workedHours)}`}>
           +{formatHours(h.overtimeHours)} OT
         </span>
       )
     }
     if (h.remainingHours <= 0) {
       return (
-        <span
-          className="ad-hours-badge done"
-          title={`Worked ${formatHours(h.workedHours)}`}
-        >
+        <span className="ad-hours-badge done" title={`Worked ${formatHours(h.workedHours)}`}>
           Complete
         </span>
       )
@@ -523,6 +524,8 @@ export default function AdminDashboard() {
     )
   }
 
+  const closeMenu = () => setMenuOpen(false)
+
   return (
     <div className="ad-shell">
       {/* ---------- Toasts ---------- */}
@@ -541,11 +544,18 @@ export default function AdminDashboard() {
         ))}
       </div>
 
+      {/* ---------- Backdrop (mobile only) ---------- */}
+      <div
+        className={`ad-backdrop ${menuOpen ? 'show' : ''}`}
+        onClick={closeMenu}
+        aria-hidden="true"
+      />
+
       {/* ---------- Sidebar ---------- */}
       <aside
+        id="ad-sidebar"
         ref={sidebarRef}
         className={`ad-sidebar ${menuOpen ? 'open' : ''}`}
-        aria-hidden={!menuOpen ? undefined : false}
         aria-label="Main navigation"
       >
         <div className="ad-brand">
@@ -560,7 +570,7 @@ export default function AdminDashboard() {
 
         <p className="ad-nav-label">DASHBOARDS</p>
         <nav className="ad-nav">
-          <button className="active" aria-current="page">▦ Attendance</button>
+          <button className="active" aria-current="page" onClick={closeMenu}>▦ Attendance</button>
           <button disabled>₱ Revenue</button>
           <button disabled>🚕 Drivers</button>
         </nav>
@@ -674,7 +684,7 @@ export default function AdminDashboard() {
 
         <section className="ad-grid">
           {/* Donut */}
-          <div className="ad-card ad-panel">
+          <div className="ad-card ad-panel ad-panel-donut">
             <div className="ad-panel-head">
               <h3>Scan Overview</h3>
             </div>
@@ -705,7 +715,7 @@ export default function AdminDashboard() {
           </div>
 
           {/* Recent activity */}
-          <div className="ad-card ad-panel">
+          <div className="ad-card ad-panel ad-panel-activity">
             <div className="ad-panel-head">
               <h3>Activities</h3>
             </div>
@@ -715,8 +725,7 @@ export default function AdminDashboard() {
                   <span className={`dot ${l.action_type}`} aria-hidden="true" />
                   <div>
                     <p>
-                      {l.driver_name}{' '}
-                      {l.action_type === 'in' ? 'timed in' : 'timed out'}
+                      {l.driver_name} {l.action_type === 'in' ? 'timed in' : 'timed out'}
                     </p>
                     <small>{timeAgo(l.created_at)}</small>
                   </div>
@@ -795,7 +804,7 @@ export default function AdminDashboard() {
                 <tbody>
                   {visibleLogs.length === 0 ? (
                     <tr>
-                      <td colSpan="8" className="ad-empty">
+                      <td colSpan="8" className="ad-empty cell-empty">
                         No attendance records found.
                       </td>
                     </tr>
@@ -805,12 +814,12 @@ export default function AdminDashboard() {
                       const isAnomaly = anomalies.has(log.id)
                       return (
                         <tr key={log.id} className={isAnomaly ? 'ad-row-anomaly' : ''}>
-                          <td>
+                          <td className="cell-driver">
                             <div className="ad-driver">
                               <span className="ad-avatar sm" aria-hidden="true">
                                 {initials(log.driver_name)}
                               </span>
-                              <span>{log.driver_name}</span>
+                              <span className="ad-driver-name">{log.driver_name}</span>
                               {isAnomaly && (
                                 <span
                                   className="ad-anomaly-badge"
@@ -822,15 +831,17 @@ export default function AdminDashboard() {
                               )}
                             </div>
                           </td>
-                          <td>{log.plate_number}</td>
-                          <td>{new Date(log.created_at).toLocaleTimeString()}</td>
-                          <td>
+                          <td data-label="Plate">{log.plate_number}</td>
+                          <td data-label="Time">
+                            {new Date(log.created_at).toLocaleTimeString()}
+                          </td>
+                          <td data-label="Action">
                             <span className={`ad-badge ${log.action_type}`}>
                               {log.action_type === 'in' ? 'TIME IN' : 'TIME OUT'}
                             </span>
                           </td>
-                          <td>{renderLocationCell(log)}</td>
-                          <td>
+                          <td data-label="Location">{renderLocationCell(log)}</td>
+                          <td data-label="Worked">
                             {h ? (
                               <span className="ad-worked" title="Total worked today">
                                 {formatHours(h.workedHours)}
@@ -846,8 +857,8 @@ export default function AdminDashboard() {
                               <span className="ad-hours-muted">—</span>
                             )}
                           </td>
-                          <td>{renderHoursCell(log.driver_name)}</td>
-                          <td>
+                          <td data-label="Hours left">{renderHoursCell(log.driver_name)}</td>
+                          <td className="cell-actions">
                             {canDelete ? (
                               <button
                                 className="ad-row-delete"
