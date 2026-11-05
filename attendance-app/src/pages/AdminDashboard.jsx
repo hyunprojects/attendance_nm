@@ -172,7 +172,7 @@ export default function AdminDashboard() {
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
   const [selectedDate, setSelectedDate] = useState(() => toDateInput())
   const [showGeofenceWarnList, setShowGeofenceWarnList] = useState(false)
-  
+
   const navigate = useNavigate()
 
   const { toasts, push: toast, dismiss: dismissToast } = useToasts()
@@ -438,6 +438,7 @@ export default function AdminDashboard() {
     }
     // Sort by furthest away
     return list.sort((a, b) => b.distance - a.distance)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [driverHours, geofence, tick, isToday])
 
   // ---------- DELETE ----------
@@ -603,9 +604,8 @@ export default function AdminDashboard() {
             <span className="ad-avatar sm" aria-hidden="true">{initials(log.driver_name)}</span>
             <span className="ad-driver-name">{log.driver_name}</span>
             {log.auto_closed && (
-              <span 
-                className="ad-auto-badge" 
-                style={{ background: 'rgba(255, 93, 93, 0.15)', color: '#ff5d5d' }} 
+              <span
+                className="ad-auto-badge"
                 title="Legacy forced clock-out. Safe to delete to restore active hours."
               >
                 AUTO-BUG
@@ -726,37 +726,59 @@ export default function AdminDashboard() {
           </div>
         </header>
 
-        <div className="ad-head">
-          <h1>Overview</h1>
-          <div className="ad-date-controls">
-            <button
-              className={`ad-btn ${isToday ? 'on' : ''}`}
-              onClick={() => setSelectedDate(toDateInput())}
-              title="Show today's attendance"
-            >Today</button>
-            <button
-              className="ad-btn"
-              onClick={() => {
-                const y = new Date(); y.setDate(y.getDate() - 1)
-                setSelectedDate(toDateInput(y))
-              }}
-              title="Show yesterday's attendance"
-            >Yesterday</button>
-            <input
-              type="date"
-              className="ad-date-input"
-              value={selectedDate}
-              max={toDateInput()}
-              onChange={(e) => setSelectedDate(e.target.value)}
-              aria-label="Select attendance date"
-            />
-            <span className="ad-date">
-              {new Date(selectedDate + 'T00:00:00').toLocaleDateString(undefined, {
-                weekday: 'long', month: 'long', day: 'numeric',
-              })}
-            </span>
+        {/* ---------- Hero banner ---------- */}
+        <section className="ad-hero" aria-label="Attendance overview">
+          <div className="ad-hero-text">
+            <h1>FLEET ATTENDANCE<br />OVERVIEW</h1>
+            <p>Live time in and time out for every NEMINTSCO driver.</p>
+            <div className="ad-date-controls">
+              <button
+                className={`ad-btn ${isToday ? 'on' : ''}`}
+                onClick={() => setSelectedDate(toDateInput())}
+                title="Show today's attendance"
+              >Today</button>
+              <button
+                className="ad-btn"
+                onClick={() => {
+                  const y = new Date(); y.setDate(y.getDate() - 1)
+                  setSelectedDate(toDateInput(y))
+                }}
+                title="Show yesterday's attendance"
+              >Yesterday</button>
+              <input
+                type="date"
+                className="ad-date-input"
+                value={selectedDate}
+                max={toDateInput()}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                aria-label="Select attendance date"
+              />
+              <span className="ad-date">
+                {new Date(selectedDate + 'T00:00:00').toLocaleDateString(undefined, {
+                  weekday: 'long', month: 'long', day: 'numeric',
+                })}
+              </span>
+            </div>
           </div>
-        </div>
+
+          <div className="ad-hero-cards">
+            <div className="ad-glass">
+              <div className="t">Time in</div>
+              <div className="n">{stats.timeIn}</div>
+              <div className="bar"><i style={{ width: stats.timeIn ? '100%' : '0%' }} /></div>
+            </div>
+            <div className="ad-glass">
+              <div className="t">Time out</div>
+              <div className="n">{stats.timeOut}</div>
+              <div className="bar"><i style={{ width: `${Math.min(100, stats.pct)}%` }} /></div>
+            </div>
+          </div>
+
+          <div className="ad-hero-kpis">
+            <div><strong>{hoursSummary.onDuty}</strong>On duty</div>
+            <div><strong>{geoSummary.inside}</strong>In geofence</div>
+          </div>
+        </section>
 
         <section className="ad-stats" aria-label="Attendance summary">
           <div className="ad-card">
@@ -776,7 +798,6 @@ export default function AdminDashboard() {
           </div>
           <div className="ad-card">
             <p>{isToday ? 'Currently on duty' : 'Unclosed sessions'}</p>
-            {/* FIX: Use hoursSummary.onDuty to accurately match the calculation strip below */}
             <h2>{hoursSummary.onDuty}</h2>
             <small>{stats.drivers} unique drivers</small>
           </div>
@@ -809,7 +830,7 @@ export default function AdminDashboard() {
 
         {isToday && outsideGeofenceDrivers.length > 0 && (
           <section className="ad-autoclose-banner" role="alert">
-            <div 
+            <div
               className="ad-warn-header"
               onClick={() => setShowGeofenceWarnList(v => !v)}
               style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', userSelect: 'none' }}
@@ -817,7 +838,7 @@ export default function AdminDashboard() {
               <strong style={{ fontSize: '16px' }}>{showGeofenceWarnList ? '▾' : '▸'}</strong>
               <strong>⚠ {outsideGeofenceDrivers.length} driver(s)</strong> currently have an open session and were last seen <b>outside the geofence</b>.
             </div>
-            
+
             {showGeofenceWarnList && (
               <>
                 <ul className="ad-geo-warn-list">
