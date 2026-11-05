@@ -171,6 +171,8 @@ export default function AdminDashboard() {
   const [groupByDriver, setGroupByDriver] = useState(false)
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
   const [selectedDate, setSelectedDate] = useState(() => toDateInput())
+  const [showGeofenceWarnList, setShowGeofenceWarnList] = useState(false)
+  
   const navigate = useNavigate()
 
   const { toasts, push: toast, dismiss: dismissToast } = useToasts()
@@ -807,29 +809,39 @@ export default function AdminDashboard() {
 
         {isToday && outsideGeofenceDrivers.length > 0 && (
           <section className="ad-autoclose-banner" role="alert">
-            <div>
-              <strong>⚠ {outsideGeofenceDrivers.length} driver(s)</strong> currently have an open session and were last seen <b>outside the geofence</b>:
-              <ul className="ad-geo-warn-list">
-                {outsideGeofenceDrivers.map((c) => (
-                  <li key={c.log.id}>
-                    <strong>{c.driver}</strong> — {c.distance}m away
-                    {c.log.latitude != null && c.log.longitude != null && (
-                      <>
-                        {' '}·{' '}
-                        <a
-                          href={mapsLink(c.log.latitude, c.log.longitude)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          view location
-                        </a>
-                      </>
-                    )}
-                  </li>
-                ))}
-              </ul>
-              <small>Drivers are <b>not</b> clocked out automatically. Verify with the driver, then clock them out manually or adjust the geofence if the radius/center is wrong.</small>
+            <div 
+              className="ad-warn-header"
+              onClick={() => setShowGeofenceWarnList(v => !v)}
+              style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px', userSelect: 'none' }}
+            >
+              <strong style={{ fontSize: '16px' }}>{showGeofenceWarnList ? '▾' : '▸'}</strong>
+              <strong>⚠ {outsideGeofenceDrivers.length} driver(s)</strong> currently have an open session and were last seen <b>outside the geofence</b>.
             </div>
+            
+            {showGeofenceWarnList && (
+              <>
+                <ul className="ad-geo-warn-list">
+                  {outsideGeofenceDrivers.map((c) => (
+                    <li key={c.log.id}>
+                      <strong>{c.driver}</strong> — {c.distance}m away
+                      {c.log.latitude != null && c.log.longitude != null && (
+                        <>
+                          {' '}·{' '}
+                          <a
+                            href={mapsLink(c.log.latitude, c.log.longitude)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            view location
+                          </a>
+                        </>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                <small>Drivers are <b>not</b> clocked out automatically. Verify with the driver, then clock them out manually or adjust the geofence if the radius/center is wrong.</small>
+              </>
+            )}
           </section>
         )}
 
