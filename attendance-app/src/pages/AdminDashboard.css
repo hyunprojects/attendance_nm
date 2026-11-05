@@ -157,6 +157,18 @@
 .ad-head h1 { margin: 0; font-size: clamp(20px, 3vw, 24px); }
 .ad-date { color: var(--muted); font-size: 13px; }
 
+/* Date controls */
+.ad-date-controls {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.ad-date-input {
+  background: var(--card); border: 1px solid var(--line); color: var(--text);
+  padding: 7px 10px; border-radius: 8px; font-size: 13px; outline: none;
+  font-family: inherit;
+}
+.ad-date-input:focus { border-color: var(--lime); }
+.ad-date-controls .ad-date { font-size: 13px; color: var(--muted); }
+
 /* ---------- Cards ---------- */
 .ad-card { background: var(--card); border-radius: 14px; padding: clamp(12px, 2vw, 16px); min-width: 0; }
 
@@ -432,6 +444,12 @@
   .ad-backdrop.show { opacity: 1; pointer-events: auto; }
 
   .ad-toasts { right: 12px; left: 12px; width: auto; }
+
+  /* Date controls stack nicely on mobile */
+  .ad-date-controls { width: 100%; }
+  .ad-date-controls .ad-btn { flex: 1 1 0; }
+  .ad-date-input { flex: 1 1 0; min-width: 0; }
+  .ad-date-controls .ad-date { width: 100%; }
 
   .ad-panel-head { align-items: stretch; }
   .ad-tools { flex: 1 1 100%; justify-content: flex-start; }

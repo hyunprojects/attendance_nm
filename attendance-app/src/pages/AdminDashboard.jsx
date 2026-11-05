@@ -14,6 +14,28 @@ const timeAgo = (iso) => {
   return `${hrs} hour${hrs > 1 ? 's' : ''} ago`
 }
 
+// ---------- DATE HELPERS ----------
+// Returns { start, end } ISO strings for a local calendar day (YYYY-MM-DD)
+const dayBounds = (dateStr) => {
+  const [y, m, d] = dateStr.split('-').map(Number)
+  const start = new Date(y, m - 1, d, 0, 0, 0, 0)
+  const end = new Date(y, m - 1, d + 1, 0, 0, 0, 0)
+  return { start: start.toISOString(), end: end.toISOString() }
+}
+
+const toDateInput = (d = new Date()) => {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+const isSameDay = (iso, dateStr) => {
+  const { start, end } = dayBounds(dateStr)
+  const t = new Date(iso).getTime()
+  return t >= new Date(start).getTime() && t < new Date(end).getTime()
+}
+
 // ---------- HOURS TRACKING ----------
 const DAILY_TARGET_HOURS = 8
 
@@ -25,7 +47,9 @@ const formatHours = (hours) => {
   return h > 0 ? `${h}h ${m}m` : `${m}m`
 }
 
-const computeDriverHours = (logs) => {
+// liveOpenSession=true → an open "in" counts as ongoing work (today).
+// liveOpenSession=false → open "in" is treated as incomplete (past days); no phantom hours.
+const computeDriverHours = (logs, { liveOpenSession = true } = {}) => {
   const now = Date.now()
   const byDriver = new Map()
   for (const log of logs) {
@@ -63,8 +87,10 @@ const computeDriverHours = (logs) => {
       }
     }
 
-    const isOnDuty = openIn !== null
+    const hasOpenSession = openIn !== null
+    const isOnDuty = hasOpenSession && liveOpenSession
     if (isOnDuty) workedMs += Math.max(0, now - openIn)
+    if (hasOpenSession && !liveOpenSession) anomalies.add(openInId)
 
     const workedHours = workedMs / 3_600_000
     const remainingHours = Math.max(0, DAILY_TARGET_HOURS - workedHours)
@@ -149,12 +175,15 @@ export default function AdminDashboard() {
   const [groupByDriver, setGroupByDriver] = useState(false)
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
   const [autoCloseBusy, setAutoCloseBusy] = useState(false)
+  const [selectedDate, setSelectedDate] = useState(() => toDateInput())
   const navigate = useNavigate()
 
   const { toasts, push: toast, dismiss: dismissToast } = useToasts()
   const sidebarRef = useRef(null)
   const burgerRef = useRef(null)
   const autoCloseRef = useRef(new Set()) // ids we've recently tried to auto-close
+
+  const isToday = selectedDate === toDateInput()
 
   // Auth guard
   useEffect(() => {
@@ -196,15 +225,15 @@ export default function AdminDashboard() {
 
   useEffect(() => { fetchGeofence() }, [fetchGeofence])
 
-  // ---------- Load logs ----------
+  // ---------- Load logs for selected date ----------
   const fetchLogs = useCallback(async () => {
-    const today = new Date()
-    today.setHours(0, 0, 0, 0)
+    const { start, end } = dayBounds(selectedDate)
 
     const { data, error } = await supabase
       .from('attendance')
       .select('*')
-      .gte('created_at', today.toISOString())
+      .gte('created_at', start)
+      .lt('created_at', end)
       .order('created_at', { ascending: false })
 
     if (error) {
@@ -214,16 +243,19 @@ export default function AdminDashboard() {
       setLogs(data)
     }
     setLoading(false)
-  }, [toast])
+  }, [selectedDate, toast])
 
   useEffect(() => {
+    setLoading(true)
     fetchLogs()
+
     const channel = supabase
       .channel('realtime-attendance')
       .on(
         'postgres_changes',
         { event: 'INSERT', schema: 'public', table: 'attendance' },
         (payload) => {
+          if (!isSameDay(payload.new.created_at, selectedDate)) return
           setLogs((prev) => {
             if (prev.some((l) => l.id === payload.new.id)) return prev
             toast(
@@ -238,6 +270,10 @@ export default function AdminDashboard() {
         'postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'attendance' },
         (payload) => {
+          if (!isSameDay(payload.new.created_at, selectedDate)) {
+            setLogs((prev) => prev.filter((l) => l.id !== payload.new.id))
+            return
+          }
           setLogs((prev) => prev.map((l) => (l.id === payload.new.id ? payload.new : l)))
         }
       )
@@ -250,7 +286,7 @@ export default function AdminDashboard() {
       )
       .subscribe()
     return () => { supabase.removeChannel(channel) }
-  }, [fetchLogs, toast])
+  }, [fetchLogs, toast, selectedDate])
 
   // Mobile menu
   useEffect(() => {
@@ -311,9 +347,9 @@ export default function AdminDashboard() {
   }, [logs])
 
   const { driverHours, anomalies } = useMemo(
-    () => computeDriverHours(logs),
+    () => computeDriverHours(logs, { liveOpenSession: isToday }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [logs, tick]
+    [logs, tick, isToday]
   )
 
   const visibleLogs = useMemo(() => {
@@ -389,9 +425,9 @@ export default function AdminDashboard() {
     return hoursSummary.onDuty + anomalies.size
   }, [hoursSummary.onDuty, anomalies.size])
 
-  // ---------- AUTO-CLOCK-OUT ----------
-  // Drivers with open session whose latest known point is outside geofence
+  // ---------- AUTO-CLOCK-OUT (today only) ----------
   const autoCloseCandidates = useMemo(() => {
+    if (!isToday) return []
     const now = Date.now()
     const list = []
     for (const [driver, h] of driverHours) {
@@ -404,7 +440,7 @@ export default function AdminDashboard() {
       }
     }
     return list
-  }, [driverHours, geofence, tick])
+  }, [driverHours, geofence, tick, isToday])
 
   const runAutoClockOut = useCallback(async (silent = false) => {
     if (!canDelete || autoCloseCandidates.length === 0 || autoCloseBusy) return
@@ -442,14 +478,13 @@ export default function AdminDashboard() {
     }
   }, [canDelete, autoCloseCandidates, autoCloseBusy, toast])
 
-  // Auto-run every 30s, and on demand via button
   useEffect(() => {
-    if (!canDelete) return
+    if (!canDelete || !isToday) return
     if (autoCloseCandidates.length === 0) return
     const id = setTimeout(() => { runAutoClockOut(true) }, 2500)
     return () => clearTimeout(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoCloseCandidates.length, canDelete])
+  }, [autoCloseCandidates.length, canDelete, isToday])
 
   // ---------- DELETE ----------
   const handleDelete = async (id) => {
@@ -468,7 +503,7 @@ export default function AdminDashboard() {
   const handleClearAll = async () => {
     if (!canDelete) return
     if (logs.length === 0) return
-    if (!window.confirm(`Delete all ${logs.length} attendance record(s) from today? This cannot be undone.`)) return
+    if (!window.confirm(`Delete all ${logs.length} attendance record(s) from ${selectedDate}? This cannot be undone.`)) return
     setClearing(true)
     const ids = logs.map((l) => l.id)
     const { error } = await supabase.from('attendance').delete().in('id', ids)
@@ -512,9 +547,8 @@ export default function AdminDashboard() {
     const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
-    const stamp = new Date().toISOString().slice(0, 10)
     a.href = url
-    a.download = `attendance-${stamp}.csv`
+    a.download = `attendance-${selectedDate}.csv`
     document.body.appendChild(a); a.click(); document.body.removeChild(a)
     URL.revokeObjectURL(url)
     toast(`Exported ${rows.length} row(s).`, 'success')
@@ -620,7 +654,7 @@ export default function AdminDashboard() {
             {isAnomaly && (
               <span
                 className="ad-anomaly-badge"
-                title="Duplicate or out-of-order scan — ignored for hours calculation"
+                title="Duplicate, out-of-order, or unclosed scan — ignored for hours calculation"
                 aria-label="Anomaly"
               >⚠</span>
             )}
@@ -636,7 +670,7 @@ export default function AdminDashboard() {
         <td data-label="Location">{renderLocationCell(log)}</td>
         <td data-label="Worked">
           {h ? (
-            <span className="ad-worked" title="Total worked today">
+            <span className="ad-worked" title="Total worked that day">
               {formatHours(h.workedHours)}
               {h.isOnDuty && <span className="ad-live-dot" title="Currently on duty" aria-label="On duty" />}
             </span>
@@ -727,23 +761,52 @@ export default function AdminDashboard() {
             aria-controls="ad-sidebar"
           >☰</button>
           <div className="ad-crumbs"><span>Dashboards</span> / <strong>Attendance</strong></div>
-          <div className="ad-live" aria-label="Live data"><i aria-hidden="true" /> Live</div>
+          <div className="ad-live" aria-label={isToday ? 'Live data' : 'Historical data'}>
+            {isToday ? <><i aria-hidden="true" /> Live</> : <>📅 {selectedDate}</>}
+          </div>
         </header>
 
         <div className="ad-head">
           <h1>Overview</h1>
-          <span className="ad-date">
-            {new Date().toLocaleDateString(undefined, {
-              weekday: 'long', month: 'long', day: 'numeric',
-            })}
-          </span>
+          <div className="ad-date-controls">
+            <button
+              className={`ad-btn ${isToday ? 'on' : ''}`}
+              onClick={() => setSelectedDate(toDateInput())}
+              title="Show today's attendance"
+            >Today</button>
+            <button
+              className="ad-btn"
+              onClick={() => {
+                const y = new Date(); y.setDate(y.getDate() - 1)
+                setSelectedDate(toDateInput(y))
+              }}
+              title="Show yesterday's attendance"
+            >Yesterday</button>
+            <input
+              type="date"
+              className="ad-date-input"
+              value={selectedDate}
+              max={toDateInput()}
+              onChange={(e) => setSelectedDate(e.target.value)}
+              aria-label="Select attendance date"
+            />
+            <span className="ad-date">
+              {new Date(selectedDate + 'T00:00:00').toLocaleDateString(undefined, {
+                weekday: 'long', month: 'long', day: 'numeric',
+              })}
+            </span>
+          </div>
         </div>
 
         <section className="ad-stats" aria-label="Attendance summary">
-          <div className="ad-card"><p>Total scans</p><h2>{stats.total}</h2><small className="up">↗ today</small></div>
+          <div className="ad-card"><p>Total scans</p><h2>{stats.total}</h2><small className="up">{isToday ? '↗ today' : `📅 ${selectedDate}`}</small></div>
           <div className="ad-card"><p>Time in</p><h2>{stats.timeIn}</h2><small className="up">↗ drivers clocked in</small></div>
           <div className="ad-card"><p>Time out</p><h2>{stats.timeOut}</h2><small className="down">↘ drivers clocked out</small></div>
-          <div className="ad-card"><p>Currently on duty</p><h2>{stats.onDuty}</h2><small>{stats.drivers} unique drivers</small></div>
+          <div className="ad-card">
+            <p>{isToday ? 'Currently on duty' : 'Unclosed sessions'}</p>
+            <h2>{stats.onDuty}</h2>
+            <small>{stats.drivers} unique drivers</small>
+          </div>
         </section>
 
         <section className="ad-hours-strip" aria-label="Hours at a glance">
@@ -771,7 +834,7 @@ export default function AdminDashboard() {
           </div>
         </section>
 
-        {autoCloseCandidates.length > 0 && canDelete && (
+        {isToday && autoCloseCandidates.length > 0 && canDelete && (
           <section className="ad-autoclose-banner" role="alert">
             <div>
               <strong>⚠ {autoCloseCandidates.length} driver(s)</strong> currently have an open session and are outside the geofence:
@@ -803,7 +866,7 @@ export default function AdminDashboard() {
                 </svg>
                 <div className="ad-donut-label">
                   <strong>{stats.total}</strong>
-                  <span>Scans today</span>
+                  <span>Scans {isToday ? 'today' : 'that day'}</span>
                 </div>
               </div>
               <ul className="ad-legend">
@@ -826,7 +889,7 @@ export default function AdminDashboard() {
                   </div>
                 </li>
               ))}
-              {logs.length === 0 && <li className="empty">No activity yet</li>}
+              {logs.length === 0 && <li className="empty">No activity {isToday ? 'yet' : 'that day'}</li>}
             </ul>
           </div>
         </section>
@@ -869,15 +932,15 @@ export default function AdminDashboard() {
                   className="ad-btn export"
                   onClick={handleExport}
                   disabled={visibleLogs.length === 0}
-                  title="Download current view as CSV"
+                  title={`Download ${selectedDate} view as CSV`}
                 >⭳ Export CSV</button>
                 {canDelete && (
                   <button
                     className="ad-btn danger"
                     onClick={handleClearAll}
                     disabled={clearing || logs.length === 0}
-                    title="Delete all of today's attendance records"
-                  >{clearing ? 'Clearing…' : '🗑 Clear all today'}</button>
+                    title={`Delete all attendance records from ${selectedDate}`}
+                  >{clearing ? 'Clearing…' : `🗑 Clear ${selectedDate}`}</button>
                 )}
               </div>
             </div>
@@ -904,7 +967,7 @@ export default function AdminDashboard() {
                   {visibleLogs.length === 0 ? (
                     <tr>
                       <td colSpan="8" className="ad-empty cell-empty">
-                        No {filter !== 'all' ? `${filter} ` : ''}attendance records found.
+                        No {filter !== 'all' ? `${filter} ` : ''}attendance records found for {selectedDate}.
                       </td>
                     </tr>
                   ) : groupByDriver ? (
