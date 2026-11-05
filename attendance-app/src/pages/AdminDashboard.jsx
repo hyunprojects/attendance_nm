@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../supabaseClient'
 import { useNavigate } from 'react-router-dom'
 import './AdminDashboard.css'
@@ -335,9 +335,8 @@ export default function AdminDashboard() {
     const timeIn = logs.filter((l) => l.action_type === 'in').length
     const timeOut = logs.filter((l) => l.action_type === 'out').length
     const drivers = new Set(logs.map((l) => l.driver_name)).size
-    const onDuty = Math.max(timeIn - timeOut, 0)
     const pct = timeIn ? Math.round((timeOut / timeIn) * 100) : 0
-    return { total: logs.length, timeIn, timeOut, drivers, onDuty, pct }
+    return { total: logs.length, timeIn, timeOut, drivers, pct }
   }, [logs])
 
   const { driverHours, anomalies } = useMemo(
@@ -435,7 +434,8 @@ export default function AdminDashboard() {
         list.push({ driver, log: l, geo, distance })
       }
     }
-    return list
+    // Sort by furthest away
+    return list.sort((a, b) => b.distance - a.distance)
   }, [driverHours, geofence, tick, isToday])
 
   // ---------- DELETE ----------
@@ -601,7 +601,13 @@ export default function AdminDashboard() {
             <span className="ad-avatar sm" aria-hidden="true">{initials(log.driver_name)}</span>
             <span className="ad-driver-name">{log.driver_name}</span>
             {log.auto_closed && (
-              <span className="ad-auto-badge" title="Auto-closed by previous legacy system">AUTO</span>
+              <span 
+                className="ad-auto-badge" 
+                style={{ background: 'rgba(255, 93, 93, 0.15)', color: '#ff5d5d' }} 
+                title="Legacy forced clock-out. Safe to delete to restore active hours."
+              >
+                AUTO-BUG
+              </span>
             )}
             {isAnomaly && (
               <span
@@ -751,12 +757,25 @@ export default function AdminDashboard() {
         </div>
 
         <section className="ad-stats" aria-label="Attendance summary">
-          <div className="ad-card"><p>Total scans</p><h2>{stats.total}</h2><small className="up">{isToday ? '↗ today' : `📅 ${selectedDate}`}</small></div>
-          <div className="ad-card"><p>Time in</p><h2>{stats.timeIn}</h2><small className="up">↗ drivers clocked in</small></div>
-          <div className="ad-card"><p>Time out</p><h2>{stats.timeOut}</h2><small className="down">↘ drivers clocked out</small></div>
+          <div className="ad-card">
+            <p>Total scans</p>
+            <h2>{stats.total}</h2>
+            <small className="up">{isToday ? '↗ today' : `📅 ${selectedDate}`}</small>
+          </div>
+          <div className="ad-card">
+            <p>Time in</p>
+            <h2>{stats.timeIn}</h2>
+            <small className="up">↗ drivers clocked in</small>
+          </div>
+          <div className="ad-card">
+            <p>Time out</p>
+            <h2>{stats.timeOut}</h2>
+            <small className="down">↘ drivers clocked out</small>
+          </div>
           <div className="ad-card">
             <p>{isToday ? 'Currently on duty' : 'Unclosed sessions'}</p>
-            <h2>{stats.onDuty}</h2>
+            {/* FIX: Use hoursSummary.onDuty to accurately match the calculation strip below */}
+            <h2>{hoursSummary.onDuty}</h2>
             <small>{stats.drivers} unique drivers</small>
           </div>
         </section>
