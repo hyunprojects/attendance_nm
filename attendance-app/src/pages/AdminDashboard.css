@@ -362,9 +362,9 @@
 }
 .ad-row-delete:disabled { opacity: .5; cursor: not-allowed; }
 
-/* ---------- Auto clock-out banner ---------- */
+/* ---------- Outside-Geofence Warning Banner ---------- */
 .ad-autoclose-banner {
-  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
   gap: 12px; margin-bottom: var(--gap);
   background: rgba(255, 184, 77, .08);
   border: 1px solid rgba(255, 184, 77, .4);
@@ -372,6 +372,35 @@
   border-radius: 12px; padding: 12px 16px; font-size: 14px;
 }
 .ad-autoclose-banner strong { color: var(--amber); }
+.ad-autoclose-banner b { color: #fff; }
+
+.ad-geo-warn-list {
+  list-style: none;
+  margin: 10px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: #ffe0b3;
+}
+.ad-geo-warn-list li {
+  overflow-wrap: anywhere;
+}
+.ad-geo-warn-list a {
+  color: #ffd08a;
+  text-decoration: underline;
+}
+.ad-geo-warn-list a:hover {
+  color: #fff;
+}
+.ad-autoclose-banner small {
+  display: block;
+  margin-top: 8px;
+  color: #e0b978;
+  font-size: 12px;
+  line-height: 1.4;
+}
 
 /* ---------- Grouped rows ---------- */
 .ad-group-row td { padding: 0; border-bottom: 1px solid var(--line); background: #1b1d22; }
@@ -500,6 +529,9 @@
   .ad-group-row td { flex: 1 1 100%; padding: 0; }
   .ad-group-head { padding: 12px 14px; }
   .ad-group-hours { margin-left: auto; }
+
+  /* Warn banner mobile */
+  .ad-autoclose-banner { flex-direction: column; }
 }
 
 @media (max-width: 400px) {

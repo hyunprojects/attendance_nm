@@ -15,7 +15,6 @@ const timeAgo = (iso) => {
 }
 
 // ---------- DATE HELPERS ----------
-// Returns { start, end } ISO strings for a local calendar day (YYYY-MM-DD)
 const dayBounds = (dateStr) => {
   const [y, m, d] = dateStr.split('-').map(Number)
   const start = new Date(y, m - 1, d, 0, 0, 0, 0)
@@ -47,8 +46,6 @@ const formatHours = (hours) => {
   return h > 0 ? `${h}h ${m}m` : `${m}m`
 }
 
-// liveOpenSession=true → an open "in" counts as ongoing work (today).
-// liveOpenSession=false → open "in" is treated as incomplete (past days); no phantom hours.
 const computeDriverHours = (logs, { liveOpenSession = true } = {}) => {
   const now = Date.now()
   const byDriver = new Map()
@@ -112,7 +109,7 @@ const computeDriverHours = (logs, { liveOpenSession = true } = {}) => {
 
 const ADMIN_EMAIL = 'elendaday@gmail.com'
 
-// Geofence fallback (used until DB settings load)
+// Geofence fallback
 const DEFAULT_GEOFENCE = { lat: 14.5995, lng: 120.9842, radiusMeters: 300 }
 
 const haversine = (lat1, lon1, lat2, lon2) => {
@@ -126,7 +123,6 @@ const haversine = (lat1, lon1, lat2, lon2) => {
   return 2 * R * Math.asin(Math.sqrt(a))
 }
 
-// Prefer per-record snapshot when available, else current global geofence
 const resolveGeofenceFor = (log, geofence) => {
   if (log?.geo_lat != null && log?.geo_lng != null && log?.geo_radius != null) {
     return { lat: log.geo_lat, lng: log.geo_lng, radiusMeters: log.geo_radius }
@@ -174,14 +170,12 @@ export default function AdminDashboard() {
   const [geoBusy, setGeoBusy] = useState(false)
   const [groupByDriver, setGroupByDriver] = useState(false)
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
-  const [autoCloseBusy, setAutoCloseBusy] = useState(false)
   const [selectedDate, setSelectedDate] = useState(() => toDateInput())
   const navigate = useNavigate()
 
   const { toasts, push: toast, dismiss: dismissToast } = useToasts()
   const sidebarRef = useRef(null)
   const burgerRef = useRef(null)
-  const autoCloseRef = useRef(new Set()) // ids we've recently tried to auto-close
 
   const isToday = selectedDate === toDateInput()
 
@@ -425,10 +419,9 @@ export default function AdminDashboard() {
     return hoursSummary.onDuty + anomalies.size
   }, [hoursSummary.onDuty, anomalies.size])
 
-  // ---------- AUTO-CLOCK-OUT (today only) ----------
-  const autoCloseCandidates = useMemo(() => {
+  // ---------- OUTSIDE-GEOFENCE WARNING (No Auto Clock-Out) ----------
+  const outsideGeofenceDrivers = useMemo(() => {
     if (!isToday) return []
-    const now = Date.now()
     const list = []
     for (const [driver, h] of driverHours) {
       if (!h.isOnDuty || !h.clockedInLog) continue
@@ -436,55 +429,14 @@ export default function AdminDashboard() {
       const geo = resolveGeofenceFor(l, geofence)
       const inside = isInsideGeofence(l.latitude, l.longitude, geo)
       if (inside === false) {
-        list.push({ driver, log: l, geo, now })
+        const distance = Math.round(
+          haversine(l.latitude, l.longitude, geo.lat, geo.lng)
+        )
+        list.push({ driver, log: l, geo, distance })
       }
     }
     return list
   }, [driverHours, geofence, tick, isToday])
-
-  const runAutoClockOut = useCallback(async (silent = false) => {
-    if (!canDelete || autoCloseCandidates.length === 0 || autoCloseBusy) return
-    const fresh = autoCloseCandidates.filter(
-      (c) => !autoCloseRef.current.has(c.log.id)
-    )
-    if (fresh.length === 0) return
-
-    setAutoCloseBusy(true)
-    let okCount = 0
-    for (const c of fresh) {
-      autoCloseRef.current.add(c.log.id)
-      const { error } = await supabase.from('attendance').insert({
-        driver_name: c.driver,
-        plate_number: c.log.plate_number,
-        action_type: 'out',
-        latitude: c.log.latitude,
-        longitude: c.log.longitude,
-        geo_lat: c.geo.lat,
-        geo_lng: c.geo.lng,
-        geo_radius: c.geo.radiusMeters,
-        auto_closed: true,
-        closed_at: new Date().toISOString(),
-      })
-      if (error) {
-        console.warn('Auto clock-out failed for', c.driver, error.message)
-        autoCloseRef.current.delete(c.log.id)
-      } else {
-        okCount++
-      }
-    }
-    setAutoCloseBusy(false)
-    if (okCount > 0 && !silent) {
-      toast(`Auto clocked-out ${okCount} driver(s) outside geofence.`, 'info')
-    }
-  }, [canDelete, autoCloseCandidates, autoCloseBusy, toast])
-
-  useEffect(() => {
-    if (!canDelete || !isToday) return
-    if (autoCloseCandidates.length === 0) return
-    const id = setTimeout(() => { runAutoClockOut(true) }, 2500)
-    return () => clearTimeout(id)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoCloseCandidates.length, canDelete, isToday])
 
   // ---------- DELETE ----------
   const handleDelete = async (id) => {
@@ -649,7 +601,7 @@ export default function AdminDashboard() {
             <span className="ad-avatar sm" aria-hidden="true">{initials(log.driver_name)}</span>
             <span className="ad-driver-name">{log.driver_name}</span>
             {log.auto_closed && (
-              <span className="ad-auto-badge" title="Auto-closed because driver left geofence">AUTO</span>
+              <span className="ad-auto-badge" title="Auto-closed by previous legacy system">AUTO</span>
             )}
             {isAnomaly && (
               <span
@@ -834,20 +786,31 @@ export default function AdminDashboard() {
           </div>
         </section>
 
-        {isToday && autoCloseCandidates.length > 0 && canDelete && (
+        {isToday && outsideGeofenceDrivers.length > 0 && (
           <section className="ad-autoclose-banner" role="alert">
             <div>
-              <strong>⚠ {autoCloseCandidates.length} driver(s)</strong> currently have an open session and are outside the geofence:
-              {' '}
-              {autoCloseCandidates.map((c) => c.driver).join(', ')}.
+              <strong>⚠ {outsideGeofenceDrivers.length} driver(s)</strong> currently have an open session and were last seen <b>outside the geofence</b>:
+              <ul className="ad-geo-warn-list">
+                {outsideGeofenceDrivers.map((c) => (
+                  <li key={c.log.id}>
+                    <strong>{c.driver}</strong> — {c.distance}m away
+                    {c.log.latitude != null && c.log.longitude != null && (
+                      <>
+                        {' '}·{' '}
+                        <a
+                          href={mapsLink(c.log.latitude, c.log.longitude)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          view location
+                        </a>
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <small>Drivers are <b>not</b> clocked out automatically. Verify with the driver, then clock them out manually or adjust the geofence if the radius/center is wrong.</small>
             </div>
-            <button
-              className="ad-btn danger"
-              disabled={autoCloseBusy}
-              onClick={() => runAutoClockOut(false)}
-            >
-              {autoCloseBusy ? 'Closing…' : 'Auto clock-out now'}
-            </button>
           </section>
         )}
 
@@ -974,8 +937,8 @@ export default function AdminDashboard() {
                     grouped.map((g) => {
                       const isCollapsed = collapsedGroups.has(g.driver)
                       return (
-                        <>
-                          <tr key={`g-${g.driver}`} className="ad-group-row">
+                        <React.Fragment key={`g-${g.driver}`}>
+                          <tr className="ad-group-row">
                             <td colSpan="8">
                               <button
                                 className="ad-group-head"
@@ -996,7 +959,7 @@ export default function AdminDashboard() {
                             </td>
                           </tr>
                           {!isCollapsed && g.items.map((log) => renderRow(log))}
-                        </>
+                        </React.Fragment>
                       )
                     })
                   ) : (
