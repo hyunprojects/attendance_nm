@@ -478,7 +478,7 @@ export default function AdminDashboard() {
     }
     const headers = [
       'Driver','Plate Number','Action','Time','Date','Worked Hours','Remaining Hours',
-      'Latitude','Longitude','Location Status','Auto-closed','Anomaly',
+      'Latitude','Longitude','Location Status','Auto-closed','Anomaly','Photo URL',
     ]
     const rows = visibleLogs.map((l) => {
       const d = new Date(l.created_at)
@@ -495,6 +495,7 @@ export default function AdminDashboard() {
         inside === null ? 'Unknown' : inside ? 'Inside geofence' : 'Outside geofence',
         l.auto_closed ? 'Yes' : '',
         anomalies.has(l.id) ? 'Duplicate / out-of-order' : '',
+        l.photo_url ?? '',
       ]
     })
     const escape = (val) => `"${String(val).replace(/"/g, '""')}"`
@@ -628,6 +629,20 @@ export default function AdminDashboard() {
           </span>
         </td>
         <td data-label="Location">{renderLocationCell(log)}</td>
+        <td data-label="Photo">
+          {log.photo_url ? (
+            <a href={log.photo_url} target="_blank" rel="noopener noreferrer" title="View full photo">
+              <img
+                src={log.photo_url}
+                alt={`${log.driver_name} ${log.action_type === 'in' ? 'time in' : 'time out'} photo`}
+                loading="lazy"
+                style={{ width: 40, height: 40, borderRadius: 10, objectFit: 'cover', display: 'block' }}
+              />
+            </a>
+          ) : (
+            <span className="ad-hours-muted">—</span>
+          )}
+        </td>
         <td data-label="Worked">
           {h ? (
             <span className="ad-worked" title="Total worked that day">
@@ -973,6 +988,7 @@ export default function AdminDashboard() {
                     <th scope="col">Time</th>
                     <th scope="col">Action</th>
                     <th scope="col">Location</th>
+                    <th scope="col">Photo</th>
                     <th scope="col">Worked</th>
                     <th scope="col">Hours left</th>
                     <th scope="col"><span className="sr-only">Actions</span></th>
@@ -981,7 +997,7 @@ export default function AdminDashboard() {
                 <tbody>
                   {visibleLogs.length === 0 ? (
                     <tr>
-                      <td colSpan="8" className="ad-empty cell-empty">
+                      <td colSpan="9" className="ad-empty cell-empty">
                         No {filter !== 'all' ? `${filter} ` : ''}attendance records found for {selectedDate}.
                       </td>
                     </tr>
@@ -991,7 +1007,7 @@ export default function AdminDashboard() {
                       return (
                         <React.Fragment key={`g-${g.driver}`}>
                           <tr className="ad-group-row">
-                            <td colSpan="8">
+                            <td colSpan="9">
                               <button
                                 className="ad-group-head"
                                 onClick={() => toggleGroup(g.driver)}

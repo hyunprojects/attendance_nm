@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { BrowserRouter, Routes, Route, Link } from 'react-router-dom'
 import { supabase } from './supabaseClient'
 import QRCode from 'react-qr-code'
@@ -50,6 +50,134 @@ function Brand() {
   )
 }
 
+// ---------- CAMERA CAPTURE ----------
+function CameraCapture({ type, onConfirm, onCancel }) {
+  const videoRef = useRef(null)
+  const [error, setError] = useState('')
+  const [ready, setReady] = useState(false)
+  const [facing, setFacing] = useState('user')
+  const [shot, setShot] = useState(null) // { blob, url }
+
+  // Start the camera (restarts on retake / flip)
+  useEffect(() => {
+    if (shot) return
+    let stream = null
+    let cancelled = false
+    setReady(false)
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('Camera is not supported on this browser.')
+      return
+    }
+
+    navigator.mediaDevices
+      .getUserMedia({
+        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 960 } },
+        audio: false,
+      })
+      .then((s) => {
+        if (cancelled) { s.getTracks().forEach((t) => t.stop()); return }
+        stream = s
+        if (videoRef.current) {
+          videoRef.current.srcObject = s
+          videoRef.current.play().catch(() => {})
+        }
+        setError('')
+      })
+      .catch(() => {
+        setError('Camera access was blocked. Please allow camera permission and try again.')
+      })
+
+    return () => {
+      cancelled = true
+      stream?.getTracks().forEach((t) => t.stop())
+    }
+  }, [facing, shot])
+
+  // Clean up preview URL
+  useEffect(() => () => { if (shot?.url) URL.revokeObjectURL(shot.url) }, [shot])
+
+  const takePhoto = () => {
+    const v = videoRef.current
+    if (!v || !v.videoWidth) return
+    const scale = Math.min(1, 960 / v.videoWidth)
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(v.videoWidth * scale)
+    canvas.height = Math.round(v.videoHeight * scale)
+    canvas.getContext('2d').drawImage(v, 0, 0, canvas.width, canvas.height)
+    canvas.toBlob(
+      (blob) => {
+        if (blob) setShot({ blob, url: URL.createObjectURL(blob) })
+      },
+      'image/jpeg',
+      0.8
+    )
+  }
+
+  // Fallback if live camera isn't available: native camera app
+  const onFile = (e) => {
+    const f = e.target.files?.[0]
+    if (f) setShot({ blob: f, url: URL.createObjectURL(f) })
+  }
+
+  return (
+    <div className="nm-cam-backdrop" role="dialog" aria-modal="true" aria-label="Take a photo">
+      <div className="nm-cam">
+        <h2 className="nm-cam-title">
+          {shot ? 'Use this photo?' : `Take a photo to TIME ${type.toUpperCase()}`}
+        </h2>
+
+        <div className="nm-cam-frame">
+          {shot ? (
+            <img src={shot.url} alt="Captured" />
+          ) : error ? (
+            <p className="nm-cam-error">{error}</p>
+          ) : (
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              className={facing === 'user' ? 'mirror' : ''}
+              onLoadedMetadata={() => setReady(true)}
+            />
+          )}
+        </div>
+
+        {shot ? (
+          <div className="nm-cam-actions">
+            <button type="button" className="nm-btn ghost" onClick={() => setShot(null)}>Retake</button>
+            <button type="button" className="nm-btn in" onClick={() => onConfirm(shot.blob)}>
+              Confirm TIME {type.toUpperCase()}
+            </button>
+          </div>
+        ) : (
+          <div className="nm-cam-actions">
+            <button type="button" className="nm-btn ghost" onClick={onCancel}>Cancel</button>
+            {error ? (
+              <label className="nm-btn in nm-file-btn">
+                Open camera
+                <input type="file" accept="image/*" capture="user" onChange={onFile} hidden />
+              </label>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="nm-btn ghost nm-flip"
+                  onClick={() => setFacing((f) => (f === 'user' ? 'environment' : 'user'))}
+                  aria-label="Switch camera"
+                >⟲</button>
+                <button type="button" className="nm-btn in" onClick={takePhoto} disabled={!ready}>
+                  📸 Capture
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // --- DRIVER SCAN COMPONENT ---
 function DriverScan() {
   const [driverName, setDriverName] = useState('')
@@ -60,6 +188,7 @@ function DriverScan() {
   const [activeType, setActiveType] = useState(null)
   const [currentGeofence, setCurrentGeofence] = useState(null)
   const [geofenceError, setGeofenceError] = useState('')
+  const [pendingType, setPendingType] = useState(null) // 'in' | 'out' | null (camera open)
 
   // Load the active geofence once when the scan page opens
   useEffect(() => {
@@ -95,27 +224,50 @@ function DriverScan() {
     setStatusType(type)
   }
 
-  const handleCheck = async (type) => {
+  // Step 1: validate, then open the camera
+  const handleCheck = (type) => {
     if (!driverName.trim()) {
       return setStatusMsg('❌ Please enter the driver name.', 'error')
     }
-
     if (!currentGeofence) {
       return setStatusMsg('⏳ Still loading location settings, please try again.', 'info')
     }
+    setStatus('')
+    setPendingType(type)
+  }
 
+  // Step 2: after photo is confirmed, upload + record
+  const submitAttendance = async (type, photoBlob) => {
+    setPendingType(null)
     setIsLoading(true)
     setActiveType(type)
+    let uploadedPath = null
 
     try {
       // ---------- GPS ----------
       setStatusMsg('📍 Getting your location… (tap Allow if prompted)', 'info')
       const pos = await getPosition()
 
-      // ---------- Insert Directly ----------
+      // ---------- Upload photo ----------
+      setStatusMsg('📤 Uploading photo…', 'info')
+      const day = new Date().toISOString().slice(0, 10)
+      uploadedPath = `${day}/${crypto.randomUUID()}.jpg`
+      const { error: upErr } = await supabase.storage
+        .from('attendance-photos')
+        .upload(uploadedPath, photoBlob, { contentType: 'image/jpeg' })
+      if (upErr) {
+        uploadedPath = null
+        setStatusMsg(`❌ Photo upload failed: ${upErr.message}`, 'error')
+        return
+      }
+      const { data: pub } = supabase.storage
+        .from('attendance-photos')
+        .getPublicUrl(uploadedPath)
+
+      // ---------- Insert ----------
       setStatusMsg('💾 Recording attendance…', 'info')
 
-      // We send exactly what the user typed. The database trigger will handle the logic.
+      // The database trigger handles the in/out logic.
       const { error } = await supabase.from('attendance').insert([{
         driver_name: driverName.trim(),
         plate_number: plateNumber.trim().toUpperCase(),
@@ -126,11 +278,13 @@ function DriverScan() {
         geo_lat:    currentGeofence.lat,
         geo_lng:    currentGeofence.lng,
         geo_radius: currentGeofence.radiusMeters,
+        photo_url:  pub.publicUrl,
       }])
 
       if (error) {
+        // Don't leave orphan photos if the trigger rejected the scan
+        await supabase.storage.from('attendance-photos').remove([uploadedPath])
         const msg = error.message || ''
-        // If your SQL trigger rejects it, it will pass the error message here
         if (msg.toLowerCase().includes('already clocked in')) {
           setStatusMsg('❌ Already clocked in. Please TIME OUT first.', 'error')
         } else if (msg.toLowerCase().includes('no open clock-in')) {
@@ -226,6 +380,14 @@ function DriverScan() {
         {status && <p className={`nm-status ${statusType}`}>{status}</p>}
         {geofenceError && <p className="nm-note">{geofenceError}</p>}
       </div>
+
+      {pendingType && (
+        <CameraCapture
+          type={pendingType}
+          onConfirm={(blob) => submitAttendance(pendingType, blob)}
+          onCancel={() => setPendingType(null)}
+        />
+      )}
 
       <p className="nm-footer">NEMINTSCO · Driver attendance</p>
     </Shell>
@@ -573,6 +735,43 @@ const css = `
   font-size: 13px;
   color: var(--nm-muted);
 }
+
+/* ---------- Camera ---------- */
+.nm-cam-backdrop {
+  position: fixed; inset: 0; z-index: 50;
+  display: grid; place-items: center;
+  padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+  background: rgba(4, 10, 18, .88);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+}
+.nm-cam {
+  width: min(100%, 440px);
+  display: flex; flex-direction: column; gap: 14px;
+}
+.nm-cam-title {
+  margin: 0; text-align: center; font-size: 18px; font-weight: 600; color: #c3d3e6;
+}
+.nm-cam-frame {
+  position: relative; width: 100%; aspect-ratio: 3 / 4;
+  max-height: 68dvh;
+  border-radius: 22px; overflow: hidden;
+  background: #0a1829;
+  border: 1px solid rgba(110, 190, 255, .3);
+  display: grid; place-items: center;
+}
+.nm-cam-frame video, .nm-cam-frame img {
+  width: 100%; height: 100%; object-fit: cover; display: block;
+}
+.nm-cam-frame video.mirror { transform: scaleX(-1); }
+.nm-cam-error { padding: 20px; text-align: center; color: #ffa3a3; font-size: 14px; }
+.nm-cam-actions { display: flex; gap: 10px; }
+.nm-cam-actions .nm-btn { flex: 1; }
+.nm-btn.ghost {
+  background: rgba(255, 255, 255, .08); color: #dce8f5;
+  border: 1px solid rgba(255, 255, 255, .15);
+}
+.nm-flip { flex: 0 0 54px !important; padding: 0; font-size: 20px; }
+.nm-file-btn { cursor: pointer; }
 
 /* Keyboard focus */
 .nm-shell :focus-visible { outline: 2px solid var(--nm-accent); outline-offset: 2px; }
