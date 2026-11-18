@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { supabase } from '../supabaseClient'
 import { useNavigate } from 'react-router-dom'
+import jsPDF from 'jspdf'
+import autoTable from 'jspdf-autotable'
 import './AdminDashboard.css'
 
 const initials = (name = '') =>
@@ -138,6 +140,55 @@ const isInsideGeofence = (lat, lng, geo) => {
 const mapsLink = (lat, lng) =>
   lat != null && lng != null ? `https://www.google.com/maps?q=${lat},${lng}` : null
 
+// ---------- CSV HELPERS ----------
+const CSV_HEADERS = [
+  'Driver','Plate Number','Action','Time','Date','Worked Hours','Remaining Hours',
+  'Latitude','Longitude','Location Status','Auto-closed','Anomaly','Photo URL',
+]
+
+const escapeCsv = (val) => `"${String(val).replace(/"/g, '""')}"`
+
+const downloadCsv = (rows, filename) => {
+  const csv = [CSV_HEADERS, ...rows].map((r) => r.map(escapeCsv).join(',')).join('\r\n')
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a); a.click(); document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+// ---------- PDF HELPERS ----------
+const loadImageAsDataUrl = async (url) => {
+  try {
+    const res = await fetch(url, { mode: 'cors' })
+    if (!res.ok) return null
+    const blob = await res.blob()
+    return await new Promise((resolve) => {
+      const reader = new FileReader()
+      reader.onloadend = () => resolve(reader.result)
+      reader.onerror = () => resolve(null)
+      reader.readAsDataURL(blob)
+    })
+  } catch {
+    return null
+  }
+}
+
+const guessImageFormat = (dataUrl) => {
+  if (!dataUrl) return 'JPEG'
+  if (dataUrl.startsWith('data:image/png')) return 'PNG'
+  if (dataUrl.startsWith('data:image/webp')) return 'WEBP'
+  return 'JPEG'
+}
+
+const formatTime = (iso) =>
+  new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+
+const formatDate = (iso) =>
+  new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+
 // ---------- TOAST ----------
 function useToasts() {
   const [toasts, setToasts] = useState([])
@@ -172,6 +223,23 @@ export default function AdminDashboard() {
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
   const [selectedDate, setSelectedDate] = useState(() => toDateInput())
   const [showGeofenceWarnList, setShowGeofenceWarnList] = useState(false)
+
+  // ---------- CSV export range state ----------
+  const [exportOpen, setExportOpen] = useState(false)
+  const [exportFrom, setExportFrom] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() - 6)
+    return toDateInput(d)
+  })
+  const [exportTo, setExportTo] = useState(() => toDateInput())
+  const [exportBusy, setExportBusy] = useState(false)
+
+  // ---------- PDF export state ----------
+  const [pdfOpen, setPdfOpen] = useState(false)
+  const [pdfFrom, setPdfFrom] = useState(() => toDateInput())
+  const [pdfTo, setPdfTo] = useState(() => toDateInput())
+  const [pdfBusy, setPdfBusy] = useState(false)
+  const [pdfProgress, setPdfProgress] = useState({ done: 0, total: 0 })
+  const [pdfIncludePhotos, setPdfIncludePhotos] = useState(true)
 
   const navigate = useNavigate()
 
@@ -365,7 +433,7 @@ export default function AdminDashboard() {
     })
   }, [logs, search, filter, driverHours])
 
-  // ---------- Grouped rows (Sort by Driver) ----------
+  // ---------- Grouped rows ----------
   const grouped = useMemo(() => {
     const map = new Map()
     for (const log of visibleLogs) {
@@ -415,12 +483,11 @@ export default function AdminDashboard() {
     return { inside, outside, unknown }
   }, [logs, geofence])
 
-  // Sidebar Drivers badge: on-duty + anomalies
   const driversBadge = useMemo(() => {
     return hoursSummary.onDuty + anomalies.size
   }, [hoursSummary.onDuty, anomalies.size])
 
-  // ---------- OUTSIDE-GEOFENCE WARNING (No Auto Clock-Out) ----------
+  // ---------- OUTSIDE-GEOFENCE WARNING ----------
   const outsideGeofenceDrivers = useMemo(() => {
     if (!isToday) return []
     const list = []
@@ -436,7 +503,6 @@ export default function AdminDashboard() {
         list.push({ driver, log: l, geo, distance })
       }
     }
-    // Sort by furthest away
     return list.sort((a, b) => b.distance - a.distance)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [driverHours, geofence, tick, isToday])
@@ -470,16 +536,12 @@ export default function AdminDashboard() {
     setClearing(false)
   }
 
-  // ---------- EXPORT ----------
+  // ---------- EXPORT CSV (current filtered view) ----------
   const handleExport = () => {
     if (visibleLogs.length === 0) {
-      toast('Nothing to export.', 'info')
+      toast('Nothing to export in the current view.', 'info')
       return
     }
-    const headers = [
-      'Driver','Plate Number','Action','Time','Date','Worked Hours','Remaining Hours',
-      'Latitude','Longitude','Location Status','Auto-closed','Anomaly','Photo URL',
-    ]
     const rows = visibleLogs.map((l) => {
       const d = new Date(l.created_at)
       const h = driverHours.get(l.driver_name)
@@ -498,16 +560,226 @@ export default function AdminDashboard() {
         l.photo_url ?? '',
       ]
     })
-    const escape = (val) => `"${String(val).replace(/"/g, '""')}"`
-    const csv = [headers, ...rows].map((r) => r.map(escape).join(',')).join('\r\n')
-    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `attendance-${selectedDate}.csv`
-    document.body.appendChild(a); a.click(); document.body.removeChild(a)
-    URL.revokeObjectURL(url)
+    downloadCsv(rows, `attendance-${selectedDate}.csv`)
     toast(`Exported ${rows.length} row(s).`, 'success')
+  }
+
+  // ---------- EXPORT CSV (date range) ----------
+  const runRangeExport = async (fromStr, toStr) => {
+    if (!fromStr || !toStr) {
+      toast('Please pick both a start and end date.', 'error')
+      return
+    }
+    if (fromStr > toStr) {
+      toast('Start date must be before (or equal to) end date.', 'error')
+      return
+    }
+
+    setExportBusy(true)
+    const { start } = dayBounds(fromStr)
+    const { end } = dayBounds(toStr)
+
+    const { data, error } = await supabase
+      .from('attendance')
+      .select('*')
+      .gte('created_at', start)
+      .lt('created_at', end)
+      .order('created_at', { ascending: true })
+
+    if (error) {
+      setExportBusy(false)
+      toast('Export failed: ' + error.message, 'error')
+      return
+    }
+    if (!data || data.length === 0) {
+      setExportBusy(false)
+      toast('No records in that date range.', 'info')
+      return
+    }
+
+    const { driverHours: rangeHours } = computeDriverHours(data, { liveOpenSession: false })
+
+    const rows = data.map((l) => {
+      const d = new Date(l.created_at)
+      const h = rangeHours.get(l.driver_name)
+      const geo = resolveGeofenceFor(l, geofence)
+      const inside = isInsideGeofence(l.latitude, l.longitude, geo)
+      return [
+        l.driver_name ?? '', l.plate_number ?? '',
+        l.action_type === 'in' ? 'TIME IN' : 'TIME OUT',
+        d.toLocaleTimeString(), d.toLocaleDateString(),
+        h ? formatHours(h.workedHours) : '',
+        h ? formatHours(h.remainingHours) : '',
+        l.latitude ?? '', l.longitude ?? '',
+        inside === null ? 'Unknown' : inside ? 'Inside geofence' : 'Outside geofence',
+        l.auto_closed ? 'Yes' : '',
+        '',
+        l.photo_url ?? '',
+      ]
+    })
+
+    downloadCsv(rows, `attendance-${fromStr}_to_${toStr}.csv`)
+    setExportBusy(false)
+    setExportOpen(false)
+    toast(`Exported ${rows.length} row(s) from ${fromStr} to ${toStr}.`, 'success')
+  }
+
+  // ---------- EXPORT PDF (with photos) ----------
+  const runPdfExport = async (fromStr, toStr, includePhotos) => {
+    if (!fromStr || !toStr) {
+      toast('Please pick both a start and end date.', 'error')
+      return
+    }
+    if (fromStr > toStr) {
+      toast('Start date must be before (or equal to) end date.', 'error')
+      return
+    }
+
+    setPdfBusy(true)
+    setPdfProgress({ done: 0, total: 0 })
+
+    const { start } = dayBounds(fromStr)
+    const { end } = dayBounds(toStr)
+
+    const { data, error } = await supabase
+      .from('attendance')
+      .select('*')
+      .gte('created_at', start)
+      .lt('created_at', end)
+      .order('created_at', { ascending: true })
+
+    if (error) {
+      setPdfBusy(false)
+      toast('PDF export failed: ' + error.message, 'error')
+      return
+    }
+    if (!data || data.length === 0) {
+      setPdfBusy(false)
+      toast('No records in that date range.', 'info')
+      return
+    }
+
+    // ---------- Pre-load photos ----------
+    const photoMap = {}
+    if (includePhotos) {
+      const withPhotos = data.filter((l) => !!l.photo_url)
+      setPdfProgress({ done: 0, total: withPhotos.length })
+      let done = 0
+      const CONCURRENCY = 6
+      for (let i = 0; i < withPhotos.length; i += CONCURRENCY) {
+        const batch = withPhotos.slice(i, i + CONCURRENCY)
+        const results = await Promise.all(
+          batch.map(async (l) => ({ id: l.id, dataUrl: await loadImageAsDataUrl(l.photo_url) }))
+        )
+        for (const r of results) photoMap[r.id] = r.dataUrl
+        done += batch.length
+        setPdfProgress({ done, total: withPhotos.length })
+      }
+    }
+
+    // ---------- Build PDF ----------
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' })
+    const pageW = doc.internal.pageSize.getWidth()
+
+    doc.setFontSize(16)
+    doc.setTextColor(20, 40, 70)
+    doc.text('NEMINTSCO — Attendance Report', 14, 14)
+    doc.setFontSize(10)
+    doc.setTextColor(100, 110, 130)
+    doc.text(`Range: ${formatDate(start)} → ${formatDate(end)}`, 14, 20)
+    doc.text(`Total scans: ${data.length}`, 14, 25)
+    doc.text(`Generated: ${new Date().toLocaleString()}`, pageW - 14, 14, { align: 'right' })
+
+    const PHOTO_W = includePhotos ? 22 : 0
+    const photoRowH = includePhotos ? 22 : 10
+
+    const body = data.map((l) => {
+      const geo = resolveGeofenceFor(l, geofence)
+      const inside = isInsideGeofence(l.latitude, l.longitude, geo)
+      const locationText =
+        inside === null
+          ? 'No GPS'
+          : inside
+            ? 'Inside'
+            : `Outside (${Math.round(haversine(l.latitude, l.longitude, geo.lat, geo.lng))}m)`
+
+      const row = [
+        l.driver_name ?? '',
+        l.plate_number ?? '',
+        formatDate(l.created_at),
+        formatTime(l.created_at),
+        l.action_type === 'in' ? 'TIME IN' : 'TIME OUT',
+        locationText,
+        l.auto_closed ? 'Yes' : '',
+      ]
+      if (includePhotos) row.push('')
+      return row
+    })
+
+    const head = includePhotos
+      ? [['Driver', 'Plate', 'Date', 'Time', 'Action', 'Location', 'Auto-closed', 'Photo']]
+      : [['Driver', 'Plate', 'Date', 'Time', 'Action', 'Location', 'Auto-closed']]
+
+    autoTable(doc, {
+      head,
+      body,
+      startY: 32,
+      styles: { fontSize: 8, cellPadding: 2, valign: 'middle', minCellHeight: photoRowH },
+      headStyles: { fillColor: [33, 72, 111], textColor: 255, fontStyle: 'bold' },
+      alternateRowStyles: { fillColor: [245, 248, 252] },
+      columnStyles: includePhotos ? { 7: { cellWidth: PHOTO_W, halign: 'center' } } : {},
+      didDrawCell: (hook) => {
+        if (!includePhotos) return
+        if (hook.section !== 'body') return
+        if (hook.column.index !== 7) return
+        const row = data[hook.row.index]
+        const dataUrl = row ? photoMap[row.id] : null
+        if (!dataUrl) {
+          doc.setFontSize(7)
+          doc.setTextColor(150, 150, 150)
+          doc.text('—', hook.cell.x + hook.cell.width / 2, hook.cell.y + hook.cell.height / 2, {
+            align: 'center',
+          })
+          return
+        }
+        const pad = 1
+        const maxW = hook.cell.width - pad * 2
+        const maxH = hook.cell.height - pad * 2
+        const imgFormat = guessImageFormat(dataUrl)
+        try {
+          doc.addImage(
+            dataUrl,
+            imgFormat,
+            hook.cell.x + pad,
+            hook.cell.y + pad,
+            maxW,
+            maxH,
+            undefined,
+            'FAST'
+          )
+        } catch {
+          // Skip unsupported image formats
+        }
+      },
+    })
+
+    const pageCount = doc.internal.getNumberOfPages()
+    for (let i = 1; i <= pageCount; i++) {
+      doc.setPage(i)
+      doc.setFontSize(8)
+      doc.setTextColor(150, 150, 150)
+      doc.text(
+        `Page ${i} of ${pageCount}`,
+        pageW / 2,
+        doc.internal.pageSize.getHeight() - 6,
+        { align: 'center' }
+      )
+    }
+
+    doc.save(`attendance-${fromStr}_to_${toStr}${includePhotos ? '' : '-no-photos'}.pdf`)
+    setPdfBusy(false)
+    setPdfOpen(false)
+    toast(`Exported PDF (${data.length} record(s)${includePhotos ? ' with photos' : ''}).`, 'success')
   }
 
   // ---------- Save geofence ----------
@@ -964,6 +1236,19 @@ export default function AdminDashboard() {
                   disabled={visibleLogs.length === 0}
                   title={`Download ${selectedDate} view as CSV`}
                 >⭳ Export CSV</button>
+
+                <button
+                  className="ad-btn export"
+                  onClick={() => setExportOpen(true)}
+                  title="Export records across a date range (CSV)"
+                >📅 Export range</button>
+
+                <button
+                  className="ad-btn export"
+                  onClick={() => { setPdfFrom(selectedDate); setPdfTo(selectedDate); setPdfOpen(true) }}
+                  title="Export records with photos as PDF"
+                >📄 Export PDF</button>
+
                 {canDelete && (
                   <button
                     className="ad-btn danger"
@@ -1074,6 +1359,135 @@ export default function AdminDashboard() {
               <button className="ad-btn" onClick={() => setGeoEditorOpen(false)}>Cancel</button>
               <button className="ad-btn export" onClick={saveGeofence} disabled={geoBusy}>
                 {geoBusy ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- CSV range export modal ---------- */}
+      {exportOpen && (
+        <div className="ad-modal-backdrop" onClick={() => !exportBusy && setExportOpen(false)}>
+          <div
+            className="ad-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="export-title"
+          >
+            <h3 id="export-title">Export attendance by date range</h3>
+            <p className="ad-modal-help">
+              Records from both start and end dates are included. Times are grouped per driver within the range.
+            </p>
+
+            <div className="ad-modal-field">
+              <label htmlFor="export-from">From</label>
+              <input
+                id="export-from"
+                type="date"
+                value={exportFrom}
+                max={exportTo || toDateInput()}
+                onChange={(e) => setExportFrom(e.target.value)}
+              />
+            </div>
+
+            <div className="ad-modal-field">
+              <label htmlFor="export-to">To</label>
+              <input
+                id="export-to"
+                type="date"
+                value={exportTo}
+                min={exportFrom}
+                max={toDateInput()}
+                onChange={(e) => setExportTo(e.target.value)}
+              />
+            </div>
+
+            <div className="ad-modal-actions">
+              <button className="ad-btn" onClick={() => setExportOpen(false)} disabled={exportBusy}>
+                Cancel
+              </button>
+              <button
+                className="ad-btn export"
+                onClick={() => runRangeExport(exportFrom, exportTo)}
+                disabled={exportBusy}
+              >
+                {exportBusy ? 'Exporting…' : 'Export range'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- PDF export modal ---------- */}
+      {pdfOpen && (
+        <div className="ad-modal-backdrop" onClick={() => !pdfBusy && setPdfOpen(false)}>
+          <div
+            className="ad-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="pdf-title"
+          >
+            <h3 id="pdf-title">Export attendance as PDF</h3>
+            <p className="ad-modal-help">
+              Photos are embedded in the PDF. Both start and end dates are included.
+            </p>
+
+            <div className="ad-modal-field">
+              <label htmlFor="pdf-from">From</label>
+              <input
+                id="pdf-from"
+                type="date"
+                value={pdfFrom}
+                max={pdfTo || toDateInput()}
+                onChange={(e) => setPdfFrom(e.target.value)}
+                disabled={pdfBusy}
+              />
+            </div>
+
+            <div className="ad-modal-field">
+              <label htmlFor="pdf-to">To</label>
+              <input
+                id="pdf-to"
+                type="date"
+                value={pdfTo}
+                min={pdfFrom}
+                max={toDateInput()}
+                onChange={(e) => setPdfTo(e.target.value)}
+                disabled={pdfBusy}
+              />
+            </div>
+
+            <div className="ad-modal-field" style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <input
+                id="pdf-photos"
+                type="checkbox"
+                checked={pdfIncludePhotos}
+                onChange={(e) => setPdfIncludePhotos(e.target.checked)}
+                disabled={pdfBusy}
+              />
+              <label htmlFor="pdf-photos" style={{ margin: 0 }}>
+                Include photos (slower, larger file)
+              </label>
+            </div>
+
+            {pdfBusy && pdfProgress.total > 0 && (
+              <p className="ad-modal-help" style={{ marginTop: 0 }}>
+                Loading photos… {pdfProgress.done} / {pdfProgress.total}
+              </p>
+            )}
+
+            <div className="ad-modal-actions">
+              <button className="ad-btn" onClick={() => setPdfOpen(false)} disabled={pdfBusy}>
+                Cancel
+              </button>
+              <button
+                className="ad-btn export"
+                onClick={() => runPdfExport(pdfFrom, pdfTo, pdfIncludePhotos)}
+                disabled={pdfBusy}
+              >
+                {pdfBusy ? 'Building PDF…' : 'Export PDF'}
               </button>
             </div>
           </div>
