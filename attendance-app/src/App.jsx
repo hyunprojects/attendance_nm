@@ -4,7 +4,6 @@ import { supabase } from './supabaseClient'
 import QRCode from 'react-qr-code'
 import Login from './pages/Login'
 import AdminDashboard from './pages/AdminDashboard'
-// import logo from './assets/nemintsco-logo.png'  // <- optional: your logo
 
 // ---------- GPS helper ----------
 const getPosition = () =>
@@ -18,11 +17,11 @@ const getPosition = () =>
           accuracy: pos.coords.accuracy,
         }),
       () => resolve(null),
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     )
   })
 
-// ---------- Fallback geofence if DB row missing ----------
+// ---------- Fallback geofence (recorded with each scan, not used to block) ----------
 const FALLBACK_GEOFENCE = { lat: 14.5995, lng: 120.9842, radiusMeters: 300 }
 
 // ---------- Shared UI pieces ----------
@@ -39,7 +38,6 @@ function Brand() {
   return (
     <div className="nm-brand">
       <div className="nm-logo" aria-hidden="true">
-        {/* <img src={logo} alt="" /> */}
         <svg viewBox="0 0 40 40" width="28" height="28" fill="none">
           <circle cx="20" cy="20" r="10" stroke="#eaf6ff" strokeWidth="3.5" />
           <circle cx="20" cy="20" r="16" stroke="#eaf6ff" strokeOpacity=".35" strokeWidth="2" />
@@ -56,9 +54,8 @@ function CameraCapture({ type, onConfirm, onCancel }) {
   const [error, setError] = useState('')
   const [ready, setReady] = useState(false)
   const [facing, setFacing] = useState('user')
-  const [shot, setShot] = useState(null) // { blob, url }
+  const [shot, setShot] = useState(null)
 
-  // Start the camera (restarts on retake / flip)
   useEffect(() => {
     if (shot) return
     let stream = null
@@ -94,7 +91,6 @@ function CameraCapture({ type, onConfirm, onCancel }) {
     }
   }, [facing, shot])
 
-  // Clean up preview URL
   useEffect(() => () => { if (shot?.url) URL.revokeObjectURL(shot.url) }, [shot])
 
   const takePhoto = () => {
@@ -106,15 +102,12 @@ function CameraCapture({ type, onConfirm, onCancel }) {
     canvas.height = Math.round(v.videoHeight * scale)
     canvas.getContext('2d').drawImage(v, 0, 0, canvas.width, canvas.height)
     canvas.toBlob(
-      (blob) => {
-        if (blob) setShot({ blob, url: URL.createObjectURL(blob) })
-      },
+      (blob) => { if (blob) setShot({ blob, url: URL.createObjectURL(blob) }) },
       'image/jpeg',
       0.8
     )
   }
 
-  // Fallback if live camera isn't available: native camera app
   const onFile = (e) => {
     const f = e.target.files?.[0]
     if (f) setShot({ blob: f, url: URL.createObjectURL(f) })
@@ -183,14 +176,15 @@ function DriverScan() {
   const [driverName, setDriverName] = useState('')
   const [plateNumber, setPlateNumber] = useState('')
   const [status, setStatus] = useState('')
-  const [statusType, setStatusType] = useState('') // '', 'ok', 'error', 'info'
+  const [statusType, setStatusType] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [activeType, setActiveType] = useState(null)
   const [currentGeofence, setCurrentGeofence] = useState(null)
-  const [geofenceError, setGeofenceError] = useState('')
-  const [pendingType, setPendingType] = useState(null) // 'in' | 'out' | null (camera open)
+  const [pendingType, setPendingType] = useState(null)
+  // GPS fix obtained in step 1 — reused on submit so we don't ask twice
+  const [verifiedPosition, setVerifiedPosition] = useState(null)
 
-  // Load the active geofence once when the scan page opens
+  // Load geofence settings (recorded with each scan; NOT used to block the driver)
   useEffect(() => {
     let cancelled = false
     supabase
@@ -203,7 +197,6 @@ function DriverScan() {
         if (error) {
           console.warn('geofence_settings load failed:', error.message)
           setCurrentGeofence(FALLBACK_GEOFENCE)
-          setGeofenceError('')
           return
         }
         if (data) {
@@ -224,19 +217,50 @@ function DriverScan() {
     setStatusType(type)
   }
 
-  // Step 1: validate, then open the camera
-  const handleCheck = (type) => {
+  // STEP 1: require LOCATION ON, then open the camera.
+  // (Geofence distance is NOT checked — only that GPS works.)
+  const handleCheck = async (type) => {
     if (!driverName.trim()) {
       return setStatusMsg('❌ Please enter the driver name.', 'error')
     }
     if (!currentGeofence) {
       return setStatusMsg('⏳ Still loading location settings, please try again.', 'info')
     }
+
     setStatus('')
-    setPendingType(type)
+    setIsLoading(true)
+    setActiveType(type)
+    setVerifiedPosition(null)
+
+    try {
+      setStatusMsg('📍 Turning on location… (tap Allow if prompted)', 'info')
+      const pos = await getPosition()
+
+      if (!pos) {
+        setStatusMsg(
+          '❌ Location is turned off or blocked. Please enable GPS / allow location access in your browser, then try again.',
+          'error'
+        )
+        setIsLoading(false)
+        setActiveType(null)
+        return
+      }
+
+      // ✅ Location is ON — proceed to camera
+      setVerifiedPosition(pos)
+      setStatusMsg('✅ Location is on. Opening camera…', 'ok')
+      setIsLoading(false)
+      setActiveType(null)
+      setPendingType(type)
+    } catch (e) {
+      console.error(e)
+      setStatusMsg(`❌ Location check failed: ${e.message}`, 'error')
+      setIsLoading(false)
+      setActiveType(null)
+    }
   }
 
-  // Step 2: after photo is confirmed, upload + record
+  // STEP 2: after photo is confirmed
   const submitAttendance = async (type, photoBlob) => {
     setPendingType(null)
     setIsLoading(true)
@@ -244,11 +268,18 @@ function DriverScan() {
     let uploadedPath = null
 
     try {
-      // ---------- GPS ----------
-      setStatusMsg('📍 Getting your location… (tap Allow if prompted)', 'info')
-      const pos = await getPosition()
+      // Try a fresh fix; fall back to the one from step 1
+      setStatusMsg('📍 Confirming location…', 'info')
+      const pos = (await getPosition()) || verifiedPosition
 
-      // ---------- Upload photo ----------
+      if (!pos) {
+        setStatusMsg(
+          '❌ Location is turned off or blocked. Please enable GPS / allow location access, then try again.',
+          'error'
+        )
+        return
+      }
+
       setStatusMsg('📤 Uploading photo…', 'info')
       const day = new Date().toISOString().slice(0, 10)
       uploadedPath = `${day}/${crypto.randomUUID()}.jpg`
@@ -264,17 +295,15 @@ function DriverScan() {
         .from('attendance-photos')
         .getPublicUrl(uploadedPath)
 
-      // ---------- Insert ----------
       setStatusMsg('💾 Recording attendance…', 'info')
 
-      // The database trigger handles the in/out logic.
       const { error } = await supabase.from('attendance').insert([{
         driver_name: driverName.trim(),
         plate_number: plateNumber.trim().toUpperCase(),
         action_type: type,
-        latitude:   pos?.latitude  ?? null,
-        longitude:  pos?.longitude ?? null,
-        accuracy:   pos?.accuracy  ?? null,
+        latitude:   pos.latitude,
+        longitude:  pos.longitude,
+        accuracy:   pos.accuracy ?? null,
         geo_lat:    currentGeofence.lat,
         geo_lng:    currentGeofence.lng,
         geo_radius: currentGeofence.radiusMeters,
@@ -282,7 +311,6 @@ function DriverScan() {
       }])
 
       if (error) {
-        // Don't leave orphan photos if the trigger rejected the scan
         await supabase.storage.from('attendance-photos').remove([uploadedPath])
         const msg = error.message || ''
         if (msg.toLowerCase().includes('already clocked in')) {
@@ -299,14 +327,10 @@ function DriverScan() {
         return
       }
 
-      setStatusMsg(
-        pos
-          ? `✅ Successfully clocked ${type.toUpperCase()}!`
-          : `✅ Clocked ${type.toUpperCase()} (location unavailable)`,
-        'ok'
-      )
+      setStatusMsg(`✅ Successfully clocked ${type.toUpperCase()}!`, 'ok')
       setDriverName('')
       setPlateNumber('')
+      setVerifiedPosition(null)
     } catch (e) {
       console.error(e)
       setStatusMsg(`❌ Unexpected error: ${e.message}`, 'error')
@@ -363,7 +387,7 @@ function DriverScan() {
             onClick={() => handleCheck('in')}
             disabled={isLoading}
           >
-            {isLoading && activeType === 'in' ? 'Please wait…' : 'TIME IN'}
+            {isLoading && activeType === 'in' ? 'Checking location…' : 'TIME IN'}
           </button>
           <button
             type="button"
@@ -371,14 +395,13 @@ function DriverScan() {
             onClick={() => handleCheck('out')}
             disabled={isLoading}
           >
-            {isLoading && activeType === 'out' ? 'Please wait…' : 'TIME OUT'}
+            {isLoading && activeType === 'out' ? 'Checking location…' : 'TIME OUT'}
           </button>
         </div>
       </div>
 
       <div aria-live="polite">
         {status && <p className={`nm-status ${statusType}`}>{status}</p>}
-        {geofenceError && <p className="nm-note">{geofenceError}</p>}
       </div>
 
       {pendingType && (
@@ -448,7 +471,7 @@ export default function App() {
   )
 }
 
-/* ---------- Styles ---------- */
+/* ---------- Styles (unchanged) ---------- */
 const css = `
 .nm-shell {
   --nm-text: #dce8f5;
@@ -481,7 +504,6 @@ const css = `
 .nm-shell *::before,
 .nm-shell *::after { box-sizing: border-box; }
 
-/* Dotted background */
 .nm-shell::before {
   content: '';
   position: absolute;
@@ -493,7 +515,6 @@ const css = `
           mask-image: radial-gradient(ellipse at center, #000 25%, transparent 78%);
 }
 
-/* ---------- Card ---------- */
 .nm-card {
   position: relative;
   z-index: 1;
@@ -512,7 +533,6 @@ const css = `
     inset 0 1px 0 rgba(255, 255, 255, .08);
 }
 
-/* Glowing top edge */
 .nm-card::before {
   content: '';
   position: absolute;
@@ -527,7 +547,6 @@ const css = `
   filter: blur(1px);
 }
 
-/* Sparkle specks near the top */
 .nm-card::after {
   content: '';
   position: absolute;
@@ -545,7 +564,6 @@ const css = `
           mask-image: linear-gradient(180deg, #000, transparent 45%);
 }
 
-/* ---------- Brand ---------- */
 .nm-brand {
   display: flex;
   flex-direction: column;
@@ -568,7 +586,7 @@ const css = `
   font-size: 13px;
   font-weight: 700;
   letter-spacing: 5px;
-  padding-left: 5px; /* balances trailing letter-spacing */
+  padding-left: 5px;
   color: #9fd8ff;
   text-shadow: 0 0 18px rgba(94, 200, 255, .45);
 }
@@ -588,7 +606,6 @@ const css = `
   color: var(--nm-muted);
 }
 
-/* ---------- Form ---------- */
 .nm-form { display: flex; flex-direction: column; gap: 12px; }
 
 .nm-field {
@@ -623,7 +640,7 @@ const css = `
   background: transparent;
   color: #eaf3ff;
   font: inherit;
-  font-size: 16px; /* 16px stops iOS zoom on focus */
+  font-size: 16px;
   line-height: 1.4;
 }
 .nm-field input::placeholder { color: rgba(127, 149, 173, .55); }
@@ -638,7 +655,6 @@ const css = `
   transition: background-color 9999s;
 }
 
-/* ---------- Buttons ---------- */
 .nm-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
 
 .nm-btn {
@@ -682,7 +698,6 @@ const css = `
   box-shadow: 0 10px 26px rgba(47, 155, 255, .35), inset 0 1px 0 rgba(255, 255, 255, .5);
 }
 
-/* ---------- Status ---------- */
 .nm-status {
   margin: 18px 0 0;
   padding: 12px 14px;
@@ -702,7 +717,6 @@ const css = `
 
 .nm-note { margin: 10px 0 0; text-align: center; font-size: 12px; color: var(--nm-muted); }
 
-/* ---------- QR ---------- */
 .nm-qr {
   align-self: center;
   width: min(100%, 248px);
@@ -736,7 +750,6 @@ const css = `
   color: var(--nm-muted);
 }
 
-/* ---------- Camera ---------- */
 .nm-cam-backdrop {
   position: fixed; inset: 0; z-index: 50;
   display: grid; place-items: center;
@@ -773,11 +786,9 @@ const css = `
 .nm-flip { flex: 0 0 54px !important; padding: 0; font-size: 20px; }
 .nm-file-btn { cursor: pointer; }
 
-/* Keyboard focus */
 .nm-shell :focus-visible { outline: 2px solid var(--nm-accent); outline-offset: 2px; }
 .nm-field input:focus-visible { outline: none; }
 
-/* Short landscape screens: scroll instead of clipping */
 @media (max-height: 700px) {
   .nm-shell { align-items: flex-start; overflow-y: auto; }
   .nm-card { margin: auto; }
