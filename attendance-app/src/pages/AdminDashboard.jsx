@@ -241,6 +241,15 @@ export default function AdminDashboard() {
   const [pdfProgress, setPdfProgress] = useState({ done: 0, total: 0 })
   const [pdfIncludePhotos, setPdfIncludePhotos] = useState(true)
 
+  // ---------- DELETE range state ----------
+  const [deleteRangeOpen, setDeleteRangeOpen] = useState(false)
+  const [deleteFrom, setDeleteFrom] = useState(() => toDateInput())
+  const [deleteTo, setDeleteTo] = useState(() => toDateInput())
+  const [deleteBusy, setDeleteBusy] = useState(false)
+  const [deleteProgress, setDeleteProgress] = useState({ done: 0, total: 0 })
+  const [deleteCount, setDeleteCount] = useState(null)
+  const [deletePreviewBusy, setDeletePreviewBusy] = useState(false)
+
   const navigate = useNavigate()
 
   const { toasts, push: toast, dismiss: dismissToast } = useToasts()
@@ -805,6 +814,115 @@ export default function AdminDashboard() {
     toast('Geofence updated.', 'success')
   }
 
+  // ---------- DELETE range: preview ----------
+  const previewRangeDelete = async (fromStr, toStr) => {
+    if (!fromStr || !toStr) { setDeleteCount(null); return }
+    if (fromStr > toStr) { setDeleteCount(null); return }
+    setDeletePreviewBusy(true)
+    const { start } = dayBounds(fromStr)
+    const { end } = dayBounds(toStr)
+    const { count, error } = await supabase
+      .from('attendance')
+      .select('id', { count: 'exact', head: true })
+      .gte('created_at', start)
+      .lt('created_at', end)
+    setDeletePreviewBusy(false)
+    if (error) {
+      toast('Could not count records: ' + error.message, 'error')
+      setDeleteCount(null)
+      return
+    }
+    setDeleteCount(count ?? 0)
+  }
+
+  // ---------- DELETE range: run ----------
+  const runRangeDelete = async (fromStr, toStr) => {
+    if (!canDelete) return
+    if (!fromStr || !toStr) {
+      toast('Please pick both a start and end date.', 'error')
+      return
+    }
+    if (fromStr > toStr) {
+      toast('Start date must be before (or equal to) end date.', 'error')
+      return
+    }
+    if (deleteCount === 0) {
+      toast('No records to delete in that range.', 'info')
+      return
+    }
+
+    const confirmed = window.confirm(
+      `Delete ${deleteCount ?? 'all'} attendance record(s) from ${fromStr} to ${toStr}?\n\nThis cannot be undone.`
+    )
+    if (!confirmed) return
+
+    setDeleteBusy(true)
+    setDeleteProgress({ done: 0, total: deleteCount || 0 })
+
+    const { start } = dayBounds(fromStr)
+    const { end } = dayBounds(toStr)
+
+    // Fetch IDs in pages to avoid the 1000-row default limit
+    const PAGE = 1000
+    let allIds = []
+    let offset = 0
+    while (true) {
+      const { data, error } = await supabase
+        .from('attendance')
+        .select('id')
+        .gte('created_at', start)
+        .lt('created_at', end)
+        .order('id', { ascending: true })
+        .range(offset, offset + PAGE - 1)
+
+      if (error) {
+        setDeleteBusy(false)
+        toast('Failed to load records: ' + error.message, 'error')
+        return
+      }
+      if (!data || data.length === 0) break
+      allIds = allIds.concat(data.map((r) => r.id))
+      if (data.length < PAGE) break
+      offset += PAGE
+    }
+
+    if (allIds.length === 0) {
+      setDeleteBusy(false)
+      toast('No records to delete in that range.', 'info')
+      return
+    }
+
+    setDeleteProgress({ done: 0, total: allIds.length })
+
+    // Delete in chunks so we don't exceed PostgREST URL limits
+    const CHUNK = 500
+    let deleted = 0
+    for (let i = 0; i < allIds.length; i += CHUNK) {
+      const chunk = allIds.slice(i, i + CHUNK)
+      const { error } = await supabase
+        .from('attendance')
+        .delete()
+        .in('id', chunk)
+      if (error) {
+        setDeleteBusy(false)
+        toast(`Deleted ${deleted} of ${allIds.length}. Error: ${error.message}`, 'error')
+        if (selectedDate >= fromStr && selectedDate <= toStr) fetchLogs()
+        return
+      }
+      deleted += chunk.length
+      setDeleteProgress({ done: deleted, total: allIds.length })
+    }
+
+    setDeleteBusy(false)
+    setDeleteRangeOpen(false)
+    setDeleteCount(null)
+    toast(`Deleted ${deleted} record(s) from ${fromStr} to ${toStr}.`, 'success')
+
+    if (selectedDate >= fromStr && selectedDate <= toStr) {
+      fetchLogs()
+    }
+  }
+
   // Donut
   const R = 70, C = 2 * Math.PI * R
   const inShare = stats.total ? stats.timeIn / stats.total : 0
@@ -1257,6 +1375,19 @@ export default function AdminDashboard() {
                     title={`Delete all attendance records from ${selectedDate}`}
                   >{clearing ? 'Clearing…' : `🗑 Clear ${selectedDate}`}</button>
                 )}
+
+                {canDelete && (
+                  <button
+                    className="ad-btn danger"
+                    onClick={() => {
+                      setDeleteFrom(exportFrom)
+                      setDeleteTo(exportTo)
+                      setDeleteCount(null)
+                      setDeleteRangeOpen(true)
+                    }}
+                    title="Delete attendance records across a date range"
+                  >🗑 Delete range</button>
+                )}
               </div>
             </div>
           </div>
@@ -1488,6 +1619,99 @@ export default function AdminDashboard() {
                 disabled={pdfBusy}
               >
                 {pdfBusy ? 'Building PDF…' : 'Export PDF'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- DELETE range modal ---------- */}
+      {deleteRangeOpen && (
+        <div
+          className="ad-modal-backdrop"
+          onClick={() => !deleteBusy && setDeleteRangeOpen(false)}
+        >
+          <div
+            className="ad-modal"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-range-title"
+          >
+            <h3 id="delete-range-title">Delete attendance by date range</h3>
+            <p className="ad-modal-help">
+              Records from both start and end dates are included. This action is{' '}
+              <b>permanent</b> and cannot be undone.
+            </p>
+
+            <div className="ad-modal-field">
+              <label htmlFor="delete-from">From</label>
+              <input
+                id="delete-from"
+                type="date"
+                value={deleteFrom}
+                max={deleteTo || toDateInput()}
+                onChange={(e) => {
+                  setDeleteFrom(e.target.value)
+                  setDeleteCount(null)
+                }}
+                disabled={deleteBusy}
+              />
+            </div>
+
+            <div className="ad-modal-field">
+              <label htmlFor="delete-to">To</label>
+              <input
+                id="delete-to"
+                type="date"
+                value={deleteTo}
+                min={deleteFrom}
+                max={toDateInput()}
+                onChange={(e) => {
+                  setDeleteTo(e.target.value)
+                  setDeleteCount(null)
+                }}
+                disabled={deleteBusy}
+              />
+            </div>
+
+            <div className="ad-modal-field-row">
+              <button
+                className="ad-btn"
+                onClick={() => previewRangeDelete(deleteFrom, deleteTo)}
+                disabled={deleteBusy || deletePreviewBusy}
+              >
+                {deletePreviewBusy ? 'Counting…' : 'Preview count'}
+              </button>
+              {deleteCount !== null && (
+                <span className="ad-modal-count">
+                  {deleteCount === 0
+                    ? 'No records in range.'
+                    : `${deleteCount} record(s) will be deleted.`}
+                </span>
+              )}
+            </div>
+
+            {deleteBusy && deleteProgress.total > 0 && (
+              <p className="ad-modal-help" style={{ marginTop: 0 }}>
+                Deleting… {deleteProgress.done} / {deleteProgress.total}
+              </p>
+            )}
+
+            <div className="ad-modal-actions">
+              <button
+                className="ad-btn"
+                onClick={() => setDeleteRangeOpen(false)}
+                disabled={deleteBusy}
+              >
+                Cancel
+              </button>
+              <button
+                className="ad-btn danger"
+                onClick={() => runRangeDelete(deleteFrom, deleteTo)}
+                disabled={deleteBusy || deleteCount === 0}
+              >
+                {deleteBusy ? 'Deleting…' : 'Delete range'}
               </button>
             </div>
           </div>
