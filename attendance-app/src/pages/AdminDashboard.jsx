@@ -4,6 +4,9 @@ import { useNavigate } from 'react-router-dom'
 import jsPDF from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import './AdminDashboard.css'
+import DriversMap from './DriversMap'
+import './DriversMap.css'
+import useDriverTracking from './useDriverTracking'
 
 const initials = (name = '') =>
   name.split(' ').filter(Boolean).slice(0, 2).map((n) => n[0]).join('').toUpperCase() || '?'
@@ -206,6 +209,20 @@ function useToasts() {
 }
 
 export default function AdminDashboard() {
+  // --- Moved/Added Tracking Logic ---
+  // NOTE: You must populate `driver` and `plate` with the actual logged-in driver's data.
+  const [driver] = useState({ name: '' }) 
+  const [plate] = useState('')             
+  const [onDuty, setOnDuty] = useState(false) 
+
+  useDriverTracking({
+    driverName: driver.name,
+    plateNumber: plate,
+    active: onDuty,
+    onError: (e) => console.warn('Tracking:', e.message),
+  })
+  // ----------------------------------
+
   const [logs, setLogs] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
@@ -223,6 +240,8 @@ export default function AdminDashboard() {
   const [collapsedGroups, setCollapsedGroups] = useState(() => new Set())
   const [selectedDate, setSelectedDate] = useState(() => toDateInput())
   const [showGeofenceWarnList, setShowGeofenceWarnList] = useState(false)
+  const [driverLocations, setDriverLocations] = useState([])
+  const [showMap, setShowMap] = useState(true)
 
   // ---------- CSV export range state ----------
   const [exportOpen, setExportOpen] = useState(false)
@@ -360,6 +379,46 @@ export default function AdminDashboard() {
       .subscribe()
     return () => { supabase.removeChannel(channel) }
   }, [fetchLogs, toast, selectedDate])
+  
+  // ---------- Live driver locations ----------
+  useEffect(() => {
+    let ignore = false
+
+    const load = async () => {
+      const { data, error } = await supabase.from('driver_locations').select('*')
+      if (!ignore && !error && data) setDriverLocations(data)
+    }
+    load()
+
+    const channel = supabase
+      .channel('realtime-driver-locations')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'driver_locations' },
+        (payload) => {
+          if (payload.eventType === 'DELETE') {
+            setDriverLocations((prev) =>
+              prev.filter((d) => d.driver_name !== payload.old.driver_name)
+            )
+            return
+          }
+          const row = payload.new
+          setDriverLocations((prev) => {
+            const i = prev.findIndex((d) => d.driver_name === row.driver_name)
+            if (i === -1) return [...prev, row]
+            const next = [...prev]
+            next[i] = row
+            return next
+          })
+        }
+      )
+      .subscribe()
+
+    return () => {
+      ignore = true
+      supabase.removeChannel(channel)
+    }
+  }, [])
 
   // Mobile menu
   useEffect(() => {
@@ -492,9 +551,9 @@ export default function AdminDashboard() {
     return { inside, outside, unknown }
   }, [logs, geofence])
 
-  const driversBadge = useMemo(() => {
-    return hoursSummary.onDuty + anomalies.size
-  }, [hoursSummary.onDuty, anomalies.size])
+ const driversBadge = useMemo(() => {
+  return hoursSummary.onDuty + anomalies.size
+}, [hoursSummary.onDuty, anomalies.size])
 
   // ---------- OUTSIDE-GEOFENCE WARNING ----------
   const outsideGeofenceDrivers = useMemo(() => {
@@ -1270,6 +1329,23 @@ export default function AdminDashboard() {
             )}
           </section>
         )}
+        {isToday && (
+  <section className="ad-card ad-panel ad-map-card" aria-label="Live driver map">
+    <div className="ad-panel-head">
+      <h3>Live driver map</h3>
+      <button className="ad-btn" onClick={() => setShowMap((v) => !v)} aria-expanded={showMap}>
+        {showMap ? 'Hide map' : 'Show map'}
+      </button>
+    </div>
+    {showMap && (
+      <DriversMap
+        locations={driverLocations}
+        geofence={geofence}
+        driverHours={driverHours}
+      />
+    )}
+  </section>
+)}
 
         <section className="ad-grid">
           <div className="ad-card ad-panel ad-panel-donut">

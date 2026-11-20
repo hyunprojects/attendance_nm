@@ -1,0 +1,71 @@
+/* Live drivers map — uses the CSS variables defined on .ad-shell */
+
+.ad-map-card { margin-bottom: var(--gap); }
+
+.dm { display: flex; flex-direction: column; gap: 12px; }
+
+.dm-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.dm-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.dm-chip { display: inline-flex; align-items: center; gap: 8px; background: var(--soft); padding: 7px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; color: var(--text); }
+.dm-chip i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dm-chip i.online { background: var(--lime-bright); box-shadow: 0 0 6px var(--lime-bright); }
+.dm-chip i.outside { background: var(--red); }
+.dm-chip i.offline { background: #b9beb0; }
+.dm-buttons { display: flex; gap: 8px; }
+
+.dm-body { display: flex; flex-wrap: wrap; gap: var(--gap); align-items: stretch; }
+.dm-map-wrap { position: relative; flex: 3 1 420px; min-width: 0; border-radius: 18px; overflow: hidden; border: 1px solid var(--line); }
+
+/* isolate + z-index keep Leaflet's internal z-indexes below the sidebar, toasts and modals */
+.dm-map { height: clamp(320px, 56vh, 520px); width: 100%; position: relative; z-index: 0; isolation: isolate; background: var(--soft); }
+
+.dm-empty { position: absolute; inset: auto 12px 12px 12px; z-index: 500; display: flex; flex-direction: column; gap: 2px; padding: 12px 14px; border-radius: 14px; background: rgba(255,255,255,.92); backdrop-filter: blur(6px); box-shadow: var(--shadow); font-size: 13px; color: var(--muted); }
+.dm-empty strong { color: var(--text); font-size: 14px; }
+
+/* Driver list */
+.dm-list { list-style: none; margin: 0; padding: 0; flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 6px; max-height: 520px; overflow-y: auto; }
+.dm-row { width: 100%; display: flex; align-items: center; gap: 10px; text-align: left; background: var(--soft); border: 1px solid transparent; border-radius: 14px; padding: 10px 12px; cursor: pointer; color: var(--text); font-family: inherit; }
+.dm-row:hover { background: #e9eee0; }
+.dm-row.sel { background: #fff; border-color: var(--lime-bright); box-shadow: 0 0 0 2px var(--lime-soft); }
+.dm-row-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.dm-row-name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dm-row-sub { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dm-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.dm-dot.online { background: var(--lime-bright); box-shadow: 0 0 6px var(--lime-bright); }
+.dm-dot.recent { background: #f2c46b; }
+.dm-dot.offline { background: #b9beb0; }
+.dm-tag { flex-shrink: 0; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+.dm-tag.inside { background: var(--lime-soft); color: #4f8a00; }
+.dm-tag.outside { background: rgba(229,83,75,.12); color: var(--red); }
+
+/* Map pins */
+.dm-pin-wrap { background: none; border: 0; }
+.dm-pin { position: relative; width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; font: 700 12px/1 'Inter', system-ui, sans-serif; color: #14170f; background: #a8e02e; border: 3px solid #fff; box-shadow: 0 4px 12px rgba(20,30,10,.35); }
+.dm-pin.recent { background: #f2c46b; }
+.dm-pin.offline { background: #c9cdc3; color: #5d6657; }
+.dm-pin.outside { background: #e5534b; color: #fff; }
+.dm-pin.online::after { content: ''; position: absolute; inset: -6px; border-radius: 50%; border: 2px solid currentColor; opacity: 0; animation: dm-ping 2s ease-out infinite; }
+.dm-pin.online { color: #14170f; }
+.dm-pin.online.outside { color: #fff; }
+.dm-pin.online::after { border-color: #a8e02e; }
+.dm-pin.online.outside::after { border-color: #e5534b; }
+@keyframes dm-ping { 0% { transform: scale(.7); opacity: .7; } 100% { transform: scale(1.35); opacity: 0; } }
+
+/* Popup */
+.dm-popup { display: flex; flex-direction: column; gap: 2px; font-family: 'Inter', system-ui, sans-serif; font-size: 13px; color: #1b1d1a; }
+.dm-popup strong { font-size: 14px; }
+.dm-popup-status.online { color: #4f8a00; font-weight: 600; }
+.dm-popup-status.recent { color: #a56a10; font-weight: 600; }
+.dm-popup-status.offline { color: #7a8077; font-weight: 600; }
+.dm-popup a { margin-top: 4px; color: #4f8a00; }
+
+@media (max-width: 760px) {
+  .dm-buttons { width: 100%; }
+  .dm-buttons .ad-btn { flex: 1 1 0; }
+  .dm-map { height: 360px; }
+  .dm-list { max-height: 280px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dm-pin.online::after { animation: none; opacity: 0; }
+}
